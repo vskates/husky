@@ -1,0 +1,9 @@
+# Rosbags
+src/rosbag2_*/
+
+# Runs (логи/артефакты)
+src/runs/
+
+# Веса моделей
+*.pth
+*.pt
