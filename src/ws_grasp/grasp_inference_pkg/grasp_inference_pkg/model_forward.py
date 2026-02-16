@@ -306,7 +306,7 @@ class GraspInferenceNode(Node):
 
             # смещение в системе base (!)
             pose_gripper.pose.position.x += -0.026
-            pose_gripper.pose.position.z += -0.075
+            pose_gripper.pose.position.z += -0.12
             pose_gripper.pose.position.y += 0.008
 
 

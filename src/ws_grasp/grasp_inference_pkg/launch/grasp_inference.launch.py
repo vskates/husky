@@ -7,7 +7,7 @@ def generate_launch_description():
     pkg_share = get_package_share_directory("grasp_inference_pkg")
 
     model_path = os.path.join(pkg_share, "models", "model_5700.pth")
-    seg_model_path = os.path.join(pkg_share, "models", "yolov8n-seg.pt")  # положите сюда веса (или укажите свой путь)
+    seg_model_path = os.path.join(pkg_share, "models", "yolo_finetuned.pt")  # положите сюда веса (или укажите свой путь)
 
     return LaunchDescription([
         Node(

@@ -1,0 +1,20 @@
+[0.372s] Invoking command in '/root/ros_ws/src/build/grasp_inference_pkg': PYTHONPATH=/root/ros_ws/src/build/grasp_inference_pkg/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/root/ros_ws/src/install/grasp_inference_pkg/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /root/ros_ws/src/build/grasp_inference_pkg/build --no-deps symlink_data
+[0.521s] running develop
+[0.593s] running egg_info
+[0.593s] writing grasp_inference_pkg.egg-info/PKG-INFO
+[0.593s] writing dependency_links to grasp_inference_pkg.egg-info/dependency_links.txt
+[0.594s] writing entry points to grasp_inference_pkg.egg-info/entry_points.txt
+[0.594s] writing requirements to grasp_inference_pkg.egg-info/requires.txt
+[0.594s] writing top-level names to grasp_inference_pkg.egg-info/top_level.txt
+[0.595s] reading manifest file 'grasp_inference_pkg.egg-info/SOURCES.txt'
+[0.596s] writing manifest file 'grasp_inference_pkg.egg-info/SOURCES.txt'
+[0.596s] running build_ext
+[0.596s] Creating /root/ros_ws/src/install/grasp_inference_pkg/lib/python3.10/site-packages/grasp-inference-pkg.egg-link (link to .)
+[0.597s] Installing camera_calibration script to /root/ros_ws/src/install/grasp_inference_pkg/lib/grasp_inference_pkg
+[0.597s] Installing grasp_node script to /root/ros_ws/src/install/grasp_inference_pkg/lib/grasp_inference_pkg
+[0.597s] Installing gripper_exec script to /root/ros_ws/src/install/grasp_inference_pkg/lib/grasp_inference_pkg
+[0.597s] Installing model_forward script to /root/ros_ws/src/install/grasp_inference_pkg/lib/grasp_inference_pkg
+[0.597s] 
+[0.597s] Installed /root/ros_ws/src/build/grasp_inference_pkg
+[0.597s] running symlink_data
+[0.615s] Invoked command in '/root/ros_ws/src/build/grasp_inference_pkg' returned '0': PYTHONPATH=/root/ros_ws/src/build/grasp_inference_pkg/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/root/ros_ws/src/install/grasp_inference_pkg/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /root/ros_ws/src/build/grasp_inference_pkg/build --no-deps symlink_data

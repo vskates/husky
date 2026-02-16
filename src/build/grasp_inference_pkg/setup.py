@@ -1,0 +1,1 @@
+/root/ros_ws/src/ws_grasp/grasp_inference_pkg/setup.py

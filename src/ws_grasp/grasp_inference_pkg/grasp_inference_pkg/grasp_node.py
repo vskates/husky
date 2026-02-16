@@ -89,15 +89,15 @@ class HeightmapNode(Node):
         self.declare_parameter("target_frame", "camera_link")
 
         self.declare_parameter("hm_size", 224)
-        self.declare_parameter("hm_resolution", 0.002)
+        self.declare_parameter("hm_resolution", 0.001)
         self.declare_parameter("plane_min", [-0.224, -0.224])
         self.declare_parameter("plane_max", [0.224, 0.224])
 
         self.declare_parameter("out_prefix", "heightmap")
         self.declare_parameter("fallback_optical_to_link", True)
 
-        # ---- YOLOv8-seg params ----
-        self.declare_parameter("seg_model_path", "yolov8n-seg.pt")
+        # ---- YOLOv8-seg params ----s
+        self.declare_parameter("seg_model_path", "yolo_finetuned.pt")
         self.declare_parameter("seg_imgsz", 640)
         self.declare_parameter("seg_conf", 0.25)
         self.declare_parameter("seg_iou", 0.7)

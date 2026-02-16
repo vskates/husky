@@ -9,7 +9,10 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ('share/grasp_inference_pkg/models',['models/model_5700.pth']),
+        ('share/grasp_inference_pkg/models', [
+            'models/model_5700.pth',
+            'models/yolo_finetuned.pt',   
+        ]),
         ("share/" + package_name + "/launch", ["launch/grasp_inference.launch.py"]),
     ],
     install_requires=["setuptools","numpy","opencv-python"],
