@@ -26,7 +26,6 @@ setup(
         "console_scripts": [
             "grasp_node = grasp_inference_pkg.grasp_node:main",
             "model_forward = grasp_inference_pkg.model_forward:main",
-            "camera_calibration = grasp_inference_pkg.camera_calibration:main",
             "gripper_exec = grasp_inference_pkg.gripper_exec:main",
         ],
     },

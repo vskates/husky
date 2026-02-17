@@ -4,14 +4,6 @@ import numpy as np
 
 
 @dataclass
-class CameraIntrinsics:
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-
-
-@dataclass
 class HeightmapSpec:
     size: int = 224
     resolution: float = 0.002  # meters per pixel
@@ -24,25 +16,6 @@ class HeightmapSpec:
     #   height axis = X, plane axes = (Y,Z) like in твоём симе
     height_axis: int = 0
     plane_axes: tuple[int, int] = (1, 2)
-
-
-def depth_to_xyz(depth_m: np.ndarray, K: CameraIntrinsics) -> np.ndarray:
-    """
-    принимает карту глубины и CameraIntrinsics, выдаёт 3 мерное представление каждого пикселя. по сути 
-    делается для того что бы получить численное значение глубины.
-    depth_m: (H,W) float32 depth in meters, in CAMERA OPTICAL frame convention.
-    Returns xyz: (H,W,3) float32 in camera frame.
-    """
-    h, w = depth_m.shape
-    u = np.arange(w, dtype=np.float32)
-    v = np.arange(h, dtype=np.float32)
-    uu, vv = np.meshgrid(u, v)
-
-    z = depth_m
-    x = (uu - K.cx) * z / K.fx
-    y = (vv - K.cy) * z / K.fy
-    xyz = np.stack([x, y, z], axis=-1).astype(np.float32)
-    return xyz
 
 
 def build_heightmaps(

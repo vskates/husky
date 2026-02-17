@@ -96,12 +96,17 @@ class HeightmapNode(Node):
         self.declare_parameter("out_prefix", "heightmap")
         self.declare_parameter("fallback_optical_to_link", True)
 
-        # ---- YOLOv8-seg params ----s
+        # ---- YOLOv8-seg params ----
         self.declare_parameter("seg_model_path", "yolo_finetuned.pt")
         self.declare_parameter("seg_imgsz", 640)
         self.declare_parameter("seg_conf", 0.25)
         self.declare_parameter("seg_iou", 0.7)
         self.declare_parameter("seg_force_cpu", False)
+        self.declare_parameter("seg_mask_persist_frames", 5)
+
+        # ---- frame accumulation params ----
+        self.declare_parameter("accumulate_frames", 10)
+        self.declare_parameter("min_coverage", 0.02)
 
         self.pcd_topic = self.get_parameter("pcd_topic").value
         self.target_frame = _norm_frame(self.get_parameter("target_frame").value)
@@ -131,6 +136,22 @@ class HeightmapNode(Node):
         self.seg_device = "cpu" if seg_force_cpu else ("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.seg = YOLO(seg_model_path)
+        self.seg_mask_persist = int(self.get_parameter("seg_mask_persist_frames").value)
+
+        # ---- frame accumulation ----
+        self.accumulate_n = int(self.get_parameter("accumulate_frames").value)
+        self.min_coverage = float(self.get_parameter("min_coverage").value)
+
+        S = self.spec.size
+        self._acc_color = np.zeros((S, S, 3), dtype=np.uint8)
+        self._acc_height = np.zeros((S, S), dtype=np.float32)
+        self._acc_mask = np.zeros((S, S), dtype=np.uint8)
+        self._acc_count: int = 0
+
+        # ---- mask temporal smoothing state ----
+        self._last_valid_mask: np.ndarray | None = None
+        self._mask_miss_count: int = 0
+
         # ---- TF ----
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -148,7 +169,15 @@ class HeightmapNode(Node):
         self.get_logger().info(f"PCD topic: {self.pcd_topic}")
         self.get_logger().info(f"target_frame: '{self.target_frame or '[use msg.frame_id]'}'")
         self.get_logger().info("Heightmap mapping: height_axis=X, plane_axes=(Y,Z)")
-        self.get_logger().info(f"Seg model: {seg_model_path} | imgsz={self.seg_imgsz} conf={self.seg_conf} iou={self.seg_iou}")
+        self.get_logger().info(
+            f"Seg model: {seg_model_path} | imgsz={self.seg_imgsz} "
+            f"conf={self.seg_conf} iou={self.seg_iou} "
+            f"mask_persist={self.seg_mask_persist} frames"
+        )
+        self.get_logger().info(
+            f"Accumulation: {self.accumulate_n} frames, "
+            f"min_coverage={self.min_coverage * 100:.0f}%"
+        )
 
     def _try_lookup_tf(self, target: str, source: str, stamp: Time):
         try:
@@ -167,7 +196,12 @@ class HeightmapNode(Node):
             )
 
     def _segment_union_mask(self, rgb_u8: np.ndarray) -> np.ndarray:
-        """Return HxW uint8 mask: 0=background, 255=object (union of all instance masks)."""
+        """Return HxW uint8 mask: 0=background, 255=object (union of all instance masks).
+
+        Applies temporal smoothing: when YOLO detects nothing on the
+        current frame, the last valid mask is reused for up to
+        ``seg_mask_persist_frames`` consecutive misses.
+        """
         img_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
         r = self.seg.predict(
             source=img_bgr,
@@ -179,14 +213,38 @@ class HeightmapNode(Node):
         )[0]
 
         H, W = rgb_u8.shape[:2]
-        if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
-            return np.zeros((H, W), dtype=np.uint8)
+        detected = not (r.masks is None or r.masks.data is None or len(r.masks.data) == 0)
 
-        m = r.masks.data  # (N,h,w) torch
-        union = (m > 0.5).any(dim=0).to("cpu").numpy().astype(np.uint8) * 255
-        if union.shape != (H, W):
-            union = cv2.resize(union, (W, H), interpolation=cv2.INTER_NEAREST)
-        return union
+        if detected:
+            m = r.masks.data  # (N,h,w) torch
+            union = (m > 0.5).any(dim=0).to("cpu").numpy().astype(np.uint8) * 255
+            if union.shape != (H, W):
+                union = cv2.resize(union, (W, H), interpolation=cv2.INTER_NEAREST)
+            self._last_valid_mask = union
+            self._mask_miss_count = 0
+            return union
+
+        # YOLO returned empty — try to reuse cached mask
+        self._mask_miss_count += 1
+
+        if (
+            self._last_valid_mask is not None
+            and self._last_valid_mask.shape == (H, W)
+            and self._mask_miss_count <= self.seg_mask_persist
+        ):
+            self.get_logger().debug(
+                f"Seg miss #{self._mask_miss_count}/{self.seg_mask_persist}, "
+                f"reusing cached mask"
+            )
+            return self._last_valid_mask
+
+        # Cache expired or never existed
+        if self._mask_miss_count == self.seg_mask_persist + 1:
+            self.get_logger().warning(
+                f"Seg missed {self._mask_miss_count} frames in a row, "
+                f"mask cache expired — publishing empty mask"
+            )
+        return np.zeros((H, W), dtype=np.uint8)
 
     def _on_pcd(self, msg: PointCloud2) -> None:
         if msg.height <= 1:
@@ -262,25 +320,74 @@ class HeightmapNode(Node):
         # ---- segmentation mask on image plane (H,W) ----
         mask_u8 = self._segment_union_mask(rgb)
 
-        # ---- build heightmaps (color, height, mask_heightmap) ----
+        # ---- build heightmap for THIS frame ----
         color_hm, height_hm, mask_hm = build_heightmaps(
             rgb_u8=rgb, xyz=xyz, spec=self.spec, mask_u8=mask_u8
         )
 
-        # ---- publish ----
+        # ---- merge into accumulator (fill pixels that have data) ----
+        has_data = height_hm != 0
+        new_pixels = int(has_data.sum())
+        self._acc_color[has_data] = color_hm[has_data]
+        self._acc_height[has_data] = height_hm[has_data]
+        self._acc_mask[has_data] = mask_hm[has_data]
+        self._acc_count += 1
+
+        S = self.spec.size
+        total_px = S * S
+        filled = int(np.count_nonzero(self._acc_height))
+        coverage = filled / total_px
+
+        self.get_logger().info(
+            f"Frame {self._acc_count}/{self.accumulate_n} | "
+            f"this={new_pixels}px | acc={filled}/{total_px} "
+            f"({coverage * 100:.1f}%)"
+        )
+
+        # ---- check if ready to publish ----
+        if self._acc_count < self.accumulate_n:
+            return
+
+        # ---- publish accumulated heightmap ----
+        if coverage < self.min_coverage:
+            self.get_logger().warning(
+                f"Coverage {coverage * 100:.1f}% < {self.min_coverage * 100:.1f}% "
+                f"after {self.accumulate_n} frames — skipping, resetting"
+            )
+            self._reset_accumulator()
+            return
+
+        self.get_logger().info(
+            f"Publishing accumulated heightmap: {filled}px "
+            f"({coverage * 100:.1f}% coverage) from {self._acc_count} frames"
+        )
+        self._publish_heightmaps(msg.header.stamp, out_frame)
+        self._reset_accumulator()
+
+    def _reset_accumulator(self) -> None:
+        self._acc_color[:] = 0
+        self._acc_height[:] = 0
+        self._acc_mask[:] = 0
+        self._acc_count = 0
+
+    def _publish_heightmaps(self, stamp, frame_id: str) -> None:
+        color_hm = self._acc_color
+        height_hm = self._acc_height
+        mask_hm = self._acc_mask
+
         msg_color = self.bridge.cv2_to_imgmsg(color_hm, encoding="rgb8")
-        msg_color.header.stamp = msg.header.stamp
-        msg_color.header.frame_id = out_frame
+        msg_color.header.stamp = stamp
+        msg_color.header.frame_id = frame_id
         self.pub_hm_color.publish(msg_color)
 
         msg_height = self.bridge.cv2_to_imgmsg(height_hm.astype(np.float32), encoding="32FC1")
-        msg_height.header.stamp = msg.header.stamp
-        msg_height.header.frame_id = out_frame
+        msg_height.header.stamp = stamp
+        msg_height.header.frame_id = frame_id
         self.pub_hm_height.publish(msg_height)
 
         # height_vis
         hm = height_hm
-        finite_h = np.isfinite(hm)
+        finite_h = np.isfinite(hm) & (hm != 0)
         vis = np.zeros_like(hm, dtype=np.uint8)
         if finite_h.any():
             vmin = float(np.nanmin(hm[finite_h]))
@@ -289,15 +396,14 @@ class HeightmapNode(Node):
                 vis = (np.clip((hm - vmin) / (vmax - vmin), 0.0, 1.0) * 255.0).astype(np.uint8)
 
         msg_vis = self.bridge.cv2_to_imgmsg(vis, encoding="mono8")
-        msg_vis.header.stamp = msg.header.stamp
-        msg_vis.header.frame_id = out_frame
+        msg_vis.header.stamp = stamp
+        msg_vis.header.frame_id = frame_id
         self.pub_hm_vis.publish(msg_vis)
 
-        # mask_heightmap (mono8 for visualization)
         mask_vis = (mask_hm > 0).astype(np.uint8) * 255
         msg_mask = self.bridge.cv2_to_imgmsg(mask_vis, encoding="mono8")
-        msg_mask.header.stamp = msg.header.stamp
-        msg_mask.header.frame_id = out_frame
+        msg_mask.header.stamp = stamp
+        msg_mask.header.frame_id = frame_id
         self.pub_hm_mask.publish(msg_mask)
 
 

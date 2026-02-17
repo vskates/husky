@@ -1,1 +1,0 @@
-/root/ros_ws/src/build/grasp_inference_pkg/launch/grasp_inference.launch.py

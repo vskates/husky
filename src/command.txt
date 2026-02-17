@@ -1,1 +1,0 @@
-ros2 topic pub --once ur5_/urscript_interface/script_command std_msgs/msg/String '{data:"movep(p[-0.09869, -0.99, 0.31674, 0.005, -2.138, 2.312], a=0.1, v=0.0.5, r=0)"}'

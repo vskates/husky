@@ -73,10 +73,14 @@ class GraspInferenceNode(Node):
         self.declare_parameter("hm_resolution", 0.002)
         self.declare_parameter("plane_min", [-0.224, -0.224])
         
+        # Стабилизация Q-map
+        self.declare_parameter("q_blur_sigma", 3.0)
+        self.declare_parameter("pose_ema_alpha", 0.4)
+
         # Трансформация
         self.declare_parameter("target_frame", "base")
         self.declare_parameter("transform_timeout", 1.0)
-        self.declare_parameter("apply_model_to_camera_transform", True)  # применять преобразование из координат модели в camera_link
+        self.declare_parameter("apply_model_to_camera_transform", True)
 
         # ---- Read parameters ----
         color_topic = self.get_parameter("color_topic").value
@@ -94,6 +98,9 @@ class GraspInferenceNode(Node):
         self.hm_resolution = float(self.get_parameter("hm_resolution").value)
         self.plane_min = np.array(self.get_parameter("plane_min").value, np.float32)
         
+        self.q_blur_sigma = float(self.get_parameter("q_blur_sigma").value)
+        self.pose_ema_alpha = float(self.get_parameter("pose_ema_alpha").value)
+
         self.target_frame = self.get_parameter("target_frame").value
         self.transform_timeout = float(self.get_parameter("transform_timeout").value)
         self.apply_model_to_camera = bool(self.get_parameter("apply_model_to_camera_transform").value)
@@ -154,12 +161,19 @@ class GraspInferenceNode(Node):
         self.depth_mean = 0.01
         self.depth_std = 0.03
 
+        # ---- EMA state for pose smoothing ----
+        self._ema_pos: np.ndarray | None = None
+
         self.get_logger().info("Subscribed to:")
         self.get_logger().info(f"  color:  {color_topic}")
         self.get_logger().info(f"  height: {height_topic}")
         self.get_logger().info(f"  mask:   {mask_topic}")
         self.get_logger().info(f"Target frame: {self.target_frame}")
         self.get_logger().info(f"Apply model→camera transform: {self.apply_model_to_camera}")
+        self.get_logger().info(
+            f"Q stabilization: blur_sigma={self.q_blur_sigma}, "
+            f"pose_ema_alpha={self.pose_ema_alpha}"
+        )
 
     @torch.inference_mode()
     def _on_heightmaps(self, color_msg: Image, height_msg: Image, mask_msg: Image):
@@ -214,9 +228,25 @@ class GraspInferenceNode(Node):
         keep_t = torch.from_numpy(keep).to(self.device).bool().unsqueeze(0)
         grasp_pred = grasp_pred.masked_fill(~keep_t, -1e9)
 
-        # argmax
-        R, H, W = grasp_pred.shape
-        flat_idx = torch.argmax(grasp_pred)
+        # ---- Gaussian blur on Q-map for stable argmax ----
+        if self.q_blur_sigma > 0:
+            q_for_argmax = grasp_pred.detach().cpu().numpy()
+            for i in range(q_for_argmax.shape[0]):
+                q_slice = q_for_argmax[i]
+                valid_q = q_slice > -1e8
+                if valid_q.any():
+                    blurred = cv2.GaussianBlur(
+                        q_slice, ksize=(0, 0), sigmaX=self.q_blur_sigma,
+                    )
+                    q_slice[valid_q] = blurred[valid_q]
+                q_for_argmax[i] = q_slice
+            grasp_smooth = torch.from_numpy(q_for_argmax).to(self.device)
+        else:
+            grasp_smooth = grasp_pred
+
+        # argmax on smoothed Q
+        R, H, W = grasp_smooth.shape
+        flat_idx = torch.argmax(grasp_smooth)
         rot = int(flat_idx // (H * W))
         rem = int(flat_idx % (H * W))
         row = int(rem // W)
@@ -226,21 +256,32 @@ class GraspInferenceNode(Node):
         q_np = q_map.detach().cpu().numpy()
 
         # ===== POSE RECONSTRUCTION =====
-        # RAW координаты из heightmap (в системе камеры)
         x_raw = float(height_hm[row, col] + self.grasp_depth_offset)
         y_raw = float(self.plane_min[0] + (self.hm_size - 1 - col) * self.hm_resolution)
         z_raw = float(self.plane_min[1] + (self.hm_size - 1 - row) * self.hm_resolution)
 
-        self.get_logger().info(f"RAW model coords: x={x_raw:.3f}, y={y_raw:.3f}, z={z_raw:.3f}")
-
-        # Преобразуем из координат модели в реальный camera_link
         if self.apply_model_to_camera:
             pos_vec = np.array([x_raw, y_raw, z_raw], dtype=np.float32)
             pos_camera = self.model_to_camera_rotation @ pos_vec
             x, y, z = float(pos_camera[0]), float(pos_camera[1]), float(pos_camera[2])
-            self.get_logger().info(f"Real camera_link coords: x={x:.3f}, y={y:.3f}, z={z:.3f}")
         else:
             x, y, z = x_raw, y_raw, z_raw
+
+        # ---- EMA smoothing on position ----
+        new_pos = np.array([x, y, z], dtype=np.float64)
+        if self._ema_pos is None:
+            self._ema_pos = new_pos
+        else:
+            a = self.pose_ema_alpha
+            self._ema_pos = a * new_pos + (1.0 - a) * self._ema_pos
+
+        x, y, z = float(self._ema_pos[0]), float(self._ema_pos[1]), float(self._ema_pos[2])
+
+        self.get_logger().info(
+            f"RAW=({x_raw:.3f},{y_raw:.3f},{z_raw:.3f}) "
+            f"EMA=({x:.3f},{y:.3f},{z:.3f}) "
+            f"pixel=({row},{col})"
+        )
 
         # Создаем PoseStamped в camera_link
         pose_camera = PoseStamped()

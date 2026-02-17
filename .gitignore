@@ -4,6 +4,11 @@ src/rosbag2_*/
 # Runs (логи/артефакты)
 src/runs/
 
+# Colcon build artifacts
+src/build/
+src/install/
+src/log/
+
 # Веса моделей
 *.pth
 *.pt
