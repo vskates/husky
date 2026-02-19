@@ -30,6 +30,10 @@ def generate_launch_description():
                 "seg_conf": 0.25,
                 "seg_iou": 0.7,
                 "seg_force_cpu": False,
+                # CLAHE для RGB (теней меньше влияют на YOLO)
+                "clahe_enable": True,
+                "clahe_clip_limit": 2.0,
+                "clahe_tile_grid_size": 8,
             }]
         ),
 

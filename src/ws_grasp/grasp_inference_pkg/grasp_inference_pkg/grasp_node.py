@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import numpy as np
 import torch
 import rclpy
@@ -26,12 +27,43 @@ def _norm_frame(s: str) -> str:
     return s
 
 
+def _is_bg_class(name: str) -> bool:
+    """Классы с меткой bg* считаются фоном: не входят в маску, не показываются."""
+    return (name or "").strip().lower().startswith("bg")
+
+
+def _mask_has_pixel_above_line(mask: np.ndarray, H: int, W: int, cutoff_row: int) -> bool:
+    """True, если у маски есть хотя бы один пиксель в области row < cutoff_row (выше линии)."""
+    if cutoff_row <= 0:
+        return True
+    if mask.shape[0] != H or mask.shape[1] != W:
+        mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+    top = min(cutoff_row, mask.shape[0])
+    return bool(np.any(mask[:top, :] > 0))
+
+
 def unpack_rgb_pcl_float(rgb_float: np.ndarray) -> np.ndarray:
     rgb_u32 = rgb_float.view(np.uint32)
     r = (rgb_u32 >> 16) & 0xFF
     g = (rgb_u32 >> 8) & 0xFF
     b = rgb_u32 & 0xFF
     return np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+
+def apply_clahe_rgb(
+    rgb: np.ndarray,
+    clip_limit: float = 2.0,
+    tile_grid_size: int = 8,
+) -> np.ndarray:
+    """CLAHE по каналу L в LAB; вход/выход RGB (H,W,3) uint8. Улучшает контраст в тенях."""
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l_ch, a, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_grid_size, tile_grid_size))
+    l_eq = clahe.apply(l_ch)
+    lab_eq = cv2.merge([l_eq, a, b_ch])
+    bgr_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(bgr_eq, cv2.COLOR_BGR2RGB)
 
 
 def transform_to_matrix(t) -> np.ndarray:
@@ -78,6 +110,12 @@ R_OPTICAL_TO_LINK = np.array(
 )
 T_OPTICAL_TO_LINK = np.zeros((3,), dtype=np.float32)
 
+# Палитра BGR для масок классов (разные оттенки для подписей)
+_CLASS_COLORS_BGR = [
+    (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+    (0, 255, 255), (128, 255, 0), (255, 128, 0), (128, 0, 255), (0, 128, 255),
+]
+
 
 class HeightmapNode(Node):
     def __init__(self) -> None:
@@ -108,6 +146,21 @@ class HeightmapNode(Node):
         self.declare_parameter("accumulate_frames", 10)
         self.declare_parameter("min_coverage", 0.02)
 
+        # ---- линия отсечения гриппера: экземпляр оставляем только если у него есть пиксель выше линии ----
+        # mask_above_line_fraction: доля высоты кадра (0..1). Верхние fraction остаются, низ отсекается. 1.0 = отключено
+        self.declare_parameter("mask_above_line_fraction", 1.0)
+
+        # ---- CLAHE для RGB (уменьшение влияния теней на YOLO) ----
+        self.declare_parameter("clahe_enable", True)
+        self.declare_parameter("clahe_clip_limit", 2.0)
+        self.declare_parameter("clahe_tile_grid_size", 8)
+
+        # ---- debug: publish YOLO mask on image plane ----
+        self.declare_parameter("debug_publish_yolo_mask", True)
+        self.declare_parameter(
+            "debug_image_raw_topic", ""
+        )  # e.g. "/camera/camera/color/image_raw" — маска накладывается и на image_raw
+
         self.pcd_topic = self.get_parameter("pcd_topic").value
         self.target_frame = _norm_frame(self.get_parameter("target_frame").value)
         self.out_prefix = self.get_parameter("out_prefix").value
@@ -137,6 +190,21 @@ class HeightmapNode(Node):
 
         self.seg = YOLO(seg_model_path)
         self.seg_mask_persist = int(self.get_parameter("seg_mask_persist_frames").value)
+        self.mask_above_line_fraction = float(self.get_parameter("mask_above_line_fraction").value)
+
+        self._clahe_enable = bool(self.get_parameter("clahe_enable").value)
+        self._clahe_clip_limit = float(self.get_parameter("clahe_clip_limit").value)
+        self._clahe_tile_grid_size = int(self.get_parameter("clahe_tile_grid_size").value)
+
+        # Классы модели: id -> имя (для дебага)
+        try:
+            names = getattr(self.seg.model, "names", None) or getattr(self.seg.predictor, "names", None)
+            if names is not None:
+                self._yolo_class_names = dict(names) if hasattr(names, "items") else dict(enumerate(names))
+            else:
+                self._yolo_class_names = {}
+        except Exception:
+            self._yolo_class_names = {}
 
         # ---- frame accumulation ----
         self.accumulate_n = int(self.get_parameter("accumulate_frames").value)
@@ -148,9 +216,10 @@ class HeightmapNode(Node):
         self._acc_mask = np.zeros((S, S), dtype=np.uint8)
         self._acc_count: int = 0
 
-        # ---- mask temporal smoothing state ----
+        # ---- mask temporal smoothing только для PCD (для image_raw — без кэша, в реальном времени) ----
         self._last_valid_mask: np.ndarray | None = None
         self._mask_miss_count: int = 0
+        self._last_yolo_classes_log: float = 0.0
 
         # ---- TF ----
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
@@ -163,6 +232,21 @@ class HeightmapNode(Node):
         self.pub_hm_vis = self.create_publisher(Image, f"~/{self.out_prefix}/height_vis", 10)
         self.pub_hm_mask = self.create_publisher(Image, f"~/{self.out_prefix}/mask", 10)
 
+        self._debug_yolo = bool(self.get_parameter("debug_publish_yolo_mask").value)
+        self.pub_debug_yolo_rgb = self.create_publisher(Image, "~/debug/yolo_mask_on_rgb", 10)
+
+        self._debug_image_raw_topic = (self.get_parameter("debug_image_raw_topic").value or "").strip()
+        if self._debug_yolo and self._debug_image_raw_topic:
+            self.pub_debug_yolo_on_image_raw = self.create_publisher(
+                Image, "~/debug/yolo_mask_on_image_raw", 10
+            )
+            self.create_subscription(
+                Image,
+                self._debug_image_raw_topic,
+                self._on_image_raw,
+                10,
+            )
+
         # ---- sub ----
         self.create_subscription(PointCloud2, self.pcd_topic, self._on_pcd, qos_profile_sensor_data)
 
@@ -174,10 +258,87 @@ class HeightmapNode(Node):
             f"conf={self.seg_conf} iou={self.seg_iou} "
             f"mask_persist={self.seg_mask_persist} frames"
         )
+        if self._yolo_class_names:
+            self.get_logger().info(
+                f"YOLO классы ({len(self._yolo_class_names)}): {self._yolo_class_names}"
+            )
+        if 0.0 < self.mask_above_line_fraction < 1.0:
+            self.get_logger().info(
+                f"mask_above_line_fraction={self.mask_above_line_fraction} (оставляем верхние {int(100*self.mask_above_line_fraction)}%%, низ отсекается)"
+            )
         self.get_logger().info(
             f"Accumulation: {self.accumulate_n} frames, "
             f"min_coverage={self.min_coverage * 100:.0f}%"
         )
+        if self._clahe_enable:
+            self.get_logger().info(
+                f"CLAHE RGB: clip_limit={self._clahe_clip_limit}, tile_grid_size={self._clahe_tile_grid_size}"
+            )
+        if self._debug_yolo:
+            self.get_logger().info(
+                "Debug YOLO: ~/debug/yolo_mask_on_rgb (PCD, с кэшем) | "
+                "~/debug/yolo_mask_on_image_raw (image_raw, в реальном времени без кэша)"
+            )
+            if self._debug_image_raw_topic:
+                self.get_logger().info(f"  image_raw topic: {self._debug_image_raw_topic}")
+
+    def _on_image_raw(self, msg: Image) -> None:
+        """YOLO по image_raw → своя маска (без ресайза), публикуем mask на image_raw."""
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+        except Exception:
+            return
+        if img.ndim != 3 or img.shape[2] != 3:
+            return
+        if self._clahe_enable:
+            img = apply_clahe_rgb(img, self._clahe_clip_limit, self._clahe_tile_grid_size)
+        mask_raw, yolo_result = self._segment_union_mask(img, cache_key="image_raw")
+        # Наложение маски на RGB: попиксельно — где mask > 0 оставляем пиксель, иначе чёрный
+        masked = np.where(mask_raw[:, :, np.newaxis] > 0, img, 0).astype(np.uint8)
+        # Визуализация масок по классам с подписями (только RGB)
+        if yolo_result is not None and yolo_result.masks is not None and hasattr(yolo_result, "boxes") and yolo_result.boxes is not None:
+            masked = self._draw_class_masks_and_labels(masked, yolo_result, img.shape[1], img.shape[0])
+        out = self.bridge.cv2_to_imgmsg(masked, encoding="rgb8")
+        out.header = msg.header
+        self.pub_debug_yolo_on_image_raw.publish(out)
+
+    def _draw_class_masks_and_labels(
+        self, masked_rgb: np.ndarray, yolo_result, W: int, H: int
+    ) -> np.ndarray:
+        """Отрисовка масок по классам и подписей на маскированном RGB (только для image_raw)."""
+        vis = cv2.cvtColor(masked_rgb, cv2.COLOR_RGB2BGR)
+        m = yolo_result.masks.data
+        boxes = yolo_result.boxes
+        if m is None or boxes is None or len(m) == 0:
+            return masked_rgb
+        n = len(m)
+        overlay_alpha = 0.45
+        for i in range(n):
+            class_id = int(boxes.cls[i].item())
+            class_name = self._yolo_class_names.get(class_id, str(class_id))
+            if _is_bg_class(class_name):
+                continue
+            mask_i = (m[i] > 0.5).to("cpu").numpy().astype(np.uint8)
+            if mask_i.shape[0] != H or mask_i.shape[1] != W:
+                mask_i = cv2.resize(mask_i, (W, H), interpolation=cv2.INTER_NEAREST)
+            cutoff_row = int(self.mask_above_line_fraction * H) if 0.0 < self.mask_above_line_fraction < 1.0 else -1
+            if cutoff_row >= 0 and not _mask_has_pixel_above_line(mask_i, H, W, cutoff_row):
+                continue
+            color = _CLASS_COLORS_BGR[class_id % len(_CLASS_COLORS_BGR)]
+            # Полупрозрачная заливка маски классом
+            where = mask_i[:, :, np.newaxis] > 0
+            vis = np.where(
+                where,
+                (vis * (1 - overlay_alpha) + np.array(color, dtype=np.uint8) * overlay_alpha).astype(np.uint8),
+                vis,
+            )
+            # Подпись класса у bbox
+            xyxy = boxes.xyxy[i].cpu().numpy()
+            x1, y1 = int(xyxy[0]), int(xyxy[1])
+            (tw, th), _ = cv2.getTextSize(class_name, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(vis, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(vis, class_name, (x1 + 2, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
 
     def _try_lookup_tf(self, target: str, source: str, stamp: Time):
         try:
@@ -195,12 +356,12 @@ class HeightmapNode(Node):
                 timeout=Duration(seconds=0.2),
             )
 
-    def _segment_union_mask(self, rgb_u8: np.ndarray) -> np.ndarray:
-        """Return HxW uint8 mask: 0=background, 255=object (union of all instance masks).
+    def _segment_union_mask(self, rgb_u8: np.ndarray, cache_key: str = "pcd"):
+        """Маска YOLO: 0=фон, 255=объект.
 
-        Applies temporal smoothing: when YOLO detects nothing on the
-        current frame, the last valid mask is reused for up to
-        ``seg_mask_persist_frames`` consecutive misses.
+        - cache_key="pcd": маска по RGB из PointCloud, с temporal smoothing (кэш при промахах).
+          Возвращает (mask, None).
+        - cache_key="image_raw": маска по image_raw, без кэша. Возвращает (mask, result) для визуализации классов.
         """
         img_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
         r = self.seg.predict(
@@ -216,35 +377,72 @@ class HeightmapNode(Node):
         detected = not (r.masks is None or r.masks.data is None or len(r.masks.data) == 0)
 
         if detected:
-            m = r.masks.data  # (N,h,w) torch
-            union = (m > 0.5).any(dim=0).to("cpu").numpy().astype(np.uint8) * 255
+            m = r.masks.data  # (N,h,w) torch, вероятности по пикселям
+            valid_ix = list(range(len(m)))
+            # Исключаем классы bg* из маски
+            if hasattr(r, "boxes") and r.boxes is not None and len(r.boxes.cls) == len(m) and self._yolo_class_names:
+                cls_ids = r.boxes.cls.cpu().numpy().astype(int)
+                valid_ix = [
+                    i for i in valid_ix
+                    if not _is_bg_class(self._yolo_class_names.get(cls_ids[i], str(cls_ids[i])))
+                ]
+            # Оставляем только экземпляры, у которых есть хотя бы один пиксель выше линии (иначе — фон, убираем класс)
+            cutoff_row = int(self.mask_above_line_fraction * H) if 0.0 < self.mask_above_line_fraction < 1.0 else -1
+            if valid_ix and cutoff_row >= 0:
+                kept = []
+                for i in valid_ix:
+                    mask_np = (m[i] > 0.5).to("cpu").numpy().astype(np.uint8)
+                    if _mask_has_pixel_above_line(mask_np, H, W, cutoff_row):
+                        kept.append(i)
+                valid_ix = kept
+            if valid_ix:
+                m = m[valid_ix]
+            else:
+                m = None
+            if m is not None and len(m) > 0:
+                union = (m > 0.5).any(dim=0).to("cpu").numpy().astype(np.uint8) * 255
+            else:
+                h, w = r.masks.data.shape[1], r.masks.data.shape[2]
+                union = np.zeros((h, w), dtype=np.uint8)
             if union.shape != (H, W):
                 union = cv2.resize(union, (W, H), interpolation=cv2.INTER_NEAREST)
-            self._last_valid_mask = union
-            self._mask_miss_count = 0
-            return union
+            if cache_key == "pcd":
+                self._last_valid_mask = union
+                self._mask_miss_count = 0
+            # Лог классов только для image_raw (без bg*, только экземпляры выше линии), не чаще раза в 2 сек
+            if cache_key == "image_raw" and self._yolo_class_names and valid_ix:
+                try:
+                    now = time.monotonic()
+                    if now - self._last_yolo_classes_log >= 2.0:
+                        self._last_yolo_classes_log = now
+                        ids = r.boxes.cls.cpu().numpy().astype(int)
+                        names = [self._yolo_class_names.get(ids[i], str(ids[i])) for i in valid_ix]
+                        unames = sorted(set(n for n in names if not _is_bg_class(n)))
+                        if unames:
+                            self.get_logger().info(f"YOLO детекция: классы {unames}")
+                except Exception:
+                    pass
+            return (union, r if cache_key == "image_raw" else None)
 
-        # YOLO returned empty — try to reuse cached mask
+        # YOLO ничего не нашёл
+        if cache_key == "image_raw":
+            return (np.zeros((H, W), dtype=np.uint8), None)
+
         self._mask_miss_count += 1
-
         if (
             self._last_valid_mask is not None
             and self._last_valid_mask.shape == (H, W)
             and self._mask_miss_count <= self.seg_mask_persist
         ):
             self.get_logger().debug(
-                f"Seg miss #{self._mask_miss_count}/{self.seg_mask_persist}, "
-                f"reusing cached mask"
+                f"Seg miss #{self._mask_miss_count}/{self.seg_mask_persist}, reusing cached mask"
             )
-            return self._last_valid_mask
-
-        # Cache expired or never existed
+            return (self._last_valid_mask, None)
         if self._mask_miss_count == self.seg_mask_persist + 1:
             self.get_logger().warning(
-                f"Seg missed {self._mask_miss_count} frames in a row, "
-                f"mask cache expired — publishing empty mask"
+                f"Seg missed {self._mask_miss_count} frames in a row, mask cache expired"
             )
-        return np.zeros((H, W), dtype=np.uint8)
+        return (np.zeros((H, W), dtype=np.uint8), None)
 
     def _on_pcd(self, msg: PointCloud2) -> None:
         if msg.height <= 1:
@@ -282,6 +480,8 @@ class HeightmapNode(Node):
 
         xyz = np.stack([arr["x"], arr["y"], arr["z"]], axis=-1).reshape(H, W, 3).astype(np.float32)
         rgb = unpack_rgb_pcl_float(arr["rgb"]).reshape(H, W, 3) if has_rgb else np.zeros((H, W, 3), dtype=np.uint8)
+        if self._clahe_enable and has_rgb:
+            rgb = apply_clahe_rgb(rgb, self._clahe_clip_limit, self._clahe_tile_grid_size)
 
         # --- transform to target_frame ---
         out_frame = src_frame
@@ -318,7 +518,14 @@ class HeightmapNode(Node):
                 out_frame = tgt_frame
 
         # ---- segmentation mask on image plane (H,W) ----
-        mask_u8 = self._segment_union_mask(rgb)
+        mask_u8, _ = self._segment_union_mask(rgb)
+
+        # ---- debug: маска YOLO по RGB из PCD (та же логика наложения: объект=RGB, фон=0) ----
+        if self._debug_yolo:
+            rgb_masked = np.where(mask_u8[:, :, np.newaxis] > 0, rgb, 0).astype(np.uint8)
+            img_msg = self.bridge.cv2_to_imgmsg(rgb_masked, encoding="rgb8")
+            img_msg.header = msg.header
+            self.pub_debug_yolo_rgb.publish(img_msg)
 
         # ---- build heightmap for THIS frame ----
         color_hm, height_hm, mask_hm = build_heightmaps(

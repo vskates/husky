@@ -1,0 +1,58 @@
+networks:
+  ros_net:
+    driver: bridge
+
+version: "3.9"
+
+services:
+  realsense_ros2:
+    networks:
+      - ros_net
+    extends:
+      file: docker-compose-gui.yml
+      service: realsense_ros2
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=21
+    runtime: nvidia
+    # Доступ к USB для RealSense (камера + возможность калибровки на хосте)
+    privileged: true
+    devices:
+      - "/dev:/dev"
+    command: >
+      ros2 launch realsense2_camera rs_launch.py
+      align_depth.enable:=true
+      pointcloud.enable:=true
+      pointcloud.ordered_pc:=true
+      decimation_filter.enable:=true
+      decimation_filter.filter_magnitude:=2
+      spatial_filter.enable:=true
+      temporal_filter.enable:=true
+      hole_filling_filter.enable:=true
+      rgb_camera.enable_auto_exposure:=true
+    # Фильтры глубины: меньше шума и артефактов в тенях в pointcloud.
+    # Для теней на RGB (YOLO): автоэкспозиция включена; при необходимости — препроцессинг (CLAHE) в ноде.
+    # Калибровка: один раз запустить Viewer из того же образа (см. ниже).
+к
+  # Калибровка глубины — тот же образ, что и realsense_ros2. Запуск разово, без профиля.
+  realsense_calibration:
+    extends:
+      file: docker-compose-gui.yml
+      service: realsense_ros2
+    networks:
+      - ros_net
+    privileged: true
+    devices:
+      - "/dev:/dev"
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: realsense-viewer
+    profiles:
+      - calibration
+    # Вариант 1 (тот же образ): docker compose -f docker-compose-realsense.yml run --rm realsense_ros2 realsense-viewer
+    # Вариант 2 (сервис калибровки): docker compose -f docker-compose-realsense.yml --profile calibration run --rm realsense_calibration
+    # На хосте один раз: xhost +local:docker
