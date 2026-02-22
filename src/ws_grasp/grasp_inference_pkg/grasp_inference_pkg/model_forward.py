@@ -212,9 +212,10 @@ class GraspInferenceNode(Node):
             return
 
 
-        trick_hhm = height_hm / 2 + 0.24
+        # trick_hhm = height_hm / 2 + 0.24
+        # new_trick_hm = height_hm/1.5 +0.12
 
-        x = self._preprocess(color_hm, trick_hhm)
+        x = self._preprocess(color_hm,height_hm)
 
         # Unet outputs logits -> sigmoid -> q_map in [0,1]
         logits = self.model(x)            # (1,1,H,W)
@@ -235,12 +236,20 @@ class GraspInferenceNode(Node):
         print(f"HEIGHT MAP {height_hm[223,112]}")
 
         valid = np.isfinite(height_hm) & (height_hm != 0)&(height_hm<1)
-        valid[:75, :] = False
-        obj = (mask_hm.astype(np.uint8) > 0)
+        valid[:180, :] = False
+        # obj = (mask_hm.astype(np.uint8) > 0)
         # if not obj.any():
-        obj = np.ones_like(obj, dtype=bool)
-        keep = valid & obj
+        # obj = np.ones_like(obj, dtype=bool)
+        # keep = valid & obj
+        keep = valid 
+        # keep = np.zeros_like(keep,dtype = bool)
+        # print(f"MEAN   {np.mean(keep)}")
+        # # if not keep.any():
+        # #     return
+        keep_count = int(np.count_nonzero(keep))
+        self.get_logger().info(f"[MASK] keep pixels: {keep_count}/{keep.size}, valid: {int(np.count_nonzero(valid))}")
         if not keep.any():
+            self.get_logger().warn("[MASK] keep is EMPTY — skipping q_canvas publish")
             return
 
         q_np_masked = q_np.copy()
@@ -310,7 +319,7 @@ class GraspInferenceNode(Node):
 
         # ===== Q canvas: карта Q ПОСЛЕ маски (только объект) + точка грипа =====
         q_vis = q_np.copy()
-        q_vis[~keep] = np.nan
+        q_vis[~keep] = 0
         vmin = np.nanmin(q_vis)
         vmax = np.nanmax(q_vis)
         if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
@@ -320,6 +329,7 @@ class GraspInferenceNode(Node):
 
         q_img = (np.nan_to_num(q_norm, nan=0.0) * 255.0).astype(np.uint8)
         heatmap = cv2.applyColorMap(q_img, cv2.COLORMAP_JET)
+        heatmap[~keep] = 0  
         heatmap = cv2.circle(heatmap, (col, row), 6, (0, 0, 255), 2)
 
         q_msg = self.bridge.cv2_to_imgmsg(heatmap, encoding="bgr8")

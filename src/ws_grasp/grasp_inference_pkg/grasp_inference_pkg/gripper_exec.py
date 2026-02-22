@@ -26,7 +26,7 @@ class GripperExecNode(Node):
         self.declare_parameter("wait_after_move", 2.0)
         self.declare_parameter("wait_after_grip", 1.5)
         self.declare_parameter("pre_grasp_offset_y", 0.07)
-        self.declare_parameter("lift_height", 0.08)
+        self.declare_parameter("lift_height", 0.03)
 
         # home_position: [x, y, z, rx, ry, rz] в координатах base (для movep)
         self.declare_parameter("home_position", [0.103, -0.302, 0.306, 0.002, 2.301, -2.172])
