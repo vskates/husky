@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import math
 import numpy as np
 import cv2
 
@@ -20,36 +19,36 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs
 
 import torch
-import torch.nn.functional as F
 
-# anti-download patch
+# --- dependency used in training ---
 try:
-    import torchvision
-    _orig_dn121 = torchvision.models.densenet.densenet121
-
-    def _dn121_no_download(*args, **kwargs):
-        if "weights" in kwargs:
-            kwargs["weights"] = None
-        if "pretrained" in kwargs:
-            kwargs["pretrained"] = False
-        return _orig_dn121(*args, **kwargs)
-
-    torchvision.models.densenet.densenet121 = _dn121_no_download
-except Exception:
-    pass
-
-try:
-    from .models import GraspNet
-except Exception:
-    from models import GraspNet
+    import segmentation_models_pytorch as smp
+except Exception as e:
+    raise RuntimeError(
+        "segmentation_models_pytorch is required (matches training). "
+        "Install it in your ROS env, then restart the node."
+    ) from e
 
 
 def _strip_module_prefix(state_dict: dict) -> dict:
     if not isinstance(state_dict, dict):
         return state_dict
-    if any(k.startswith("module.") for k in state_dict.keys()):
+    if any(isinstance(k, str) and k.startswith("module.") for k in state_dict.keys()):
         return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
     return state_dict
+
+
+def _extract_q_state(ckpt) -> dict:
+    """
+    Trainer.save() in Isaac-5 base mode saves:
+        {'q_func': state_dict}
+    but we also accept direct state_dict.
+    """
+    if isinstance(ckpt, dict) and "q_func" in ckpt and isinstance(ckpt["q_func"], dict):
+        return ckpt["q_func"]
+    if isinstance(ckpt, dict) and all(isinstance(k, str) for k in ckpt.keys()):
+        return ckpt
+    raise ValueError("Unsupported checkpoint format. Expected dict with key 'q_func' or a state_dict.")
 
 
 class GraspInferenceNode(Node):
@@ -57,29 +56,32 @@ class GraspInferenceNode(Node):
         super().__init__("grasp_inference_node")
         self.bridge = CvBridge()
 
-        # ---- Parameters ----
+        # ---- Topics ----
         self.declare_parameter("color_topic", "/heightmap_node/heightmap/color")
         self.declare_parameter("height_topic", "/heightmap_node/heightmap/height")
         self.declare_parameter("mask_topic", "/heightmap_node/heightmap/mask")
 
+        # ---- Model ----
         self.declare_parameter("model_path", "")
         self.declare_parameter("force_cpu", False)
 
-        self.declare_parameter("num_rotations", 16)
-        self.declare_parameter("grasp_depth_offset", 0.0)
+        # ---- Geometry (must match HeightmapNode + sim CAMERA_WORKSPACE) ----
+        self.declare_parameter("hm_size", 224)
+        self.declare_parameter("hm_resolution", 0.001)
+        self.declare_parameter("plane_min", [0.438, 0.888])
+        self.declare_parameter("grasp_depth_offset", 0.00)  # == GRASP_DEPTH in sim (base mode)
+
+        # ---- Sync: sync_slop (сек) — макс. разброс времени между color/height/mask,
+        # чтобы ApproximateTimeSynchronizer объединил их в один вызов коллбэка ----
         self.declare_parameter("sync_slop", 0.1)
 
-        self.declare_parameter("hm_size", 224)
-        self.declare_parameter("hm_resolution", 0.002)
-        self.declare_parameter("plane_min", [-0.224, -0.224])
-        
-        # Стабилизация Q-map
-        self.declare_parameter("q_blur_sigma", 3.0)
+        # ---- Stabilization (EMA по позе закомментировано для дебага) ----
         self.declare_parameter("pose_ema_alpha", 0.4)
 
-        # Трансформация
+        # ---- TF output ----
         self.declare_parameter("target_frame", "base")
         self.declare_parameter("transform_timeout", 1.0)
+        # Преобразование из координат модели (raw) в camera_link: x_raw=z_cam, y_raw=-x_cam, z_raw=-y_cam
         self.declare_parameter("apply_model_to_camera_transform", True)
 
         # ---- Read parameters ----
@@ -90,33 +92,28 @@ class GraspInferenceNode(Node):
         model_path = self.get_parameter("model_path").value
         force_cpu = bool(self.get_parameter("force_cpu").value)
 
-        self.num_rotations = int(self.get_parameter("num_rotations").value)
-        self.grasp_depth_offset = float(self.get_parameter("grasp_depth_offset").value)
-        sync_slop = float(self.get_parameter("sync_slop").value)
-
         self.hm_size = int(self.get_parameter("hm_size").value)
         self.hm_resolution = float(self.get_parameter("hm_resolution").value)
         self.plane_min = np.array(self.get_parameter("plane_min").value, np.float32)
-        
-        self.q_blur_sigma = float(self.get_parameter("q_blur_sigma").value)
-        self.pose_ema_alpha = float(self.get_parameter("pose_ema_alpha").value)
+        self.grasp_depth_offset = float(self.get_parameter("grasp_depth_offset").value)
+
+        sync_slop = float(self.get_parameter("sync_slop").value)
+        # self.pose_ema_alpha = float(self.get_parameter("pose_ema_alpha").value)  # отключено для дебага
+        self.pose_ema_alpha = 0.4  # не используется при отключённом EMA
 
         self.target_frame = self.get_parameter("target_frame").value
         self.transform_timeout = float(self.get_parameter("transform_timeout").value)
         self.apply_model_to_camera = bool(self.get_parameter("apply_model_to_camera_transform").value)
 
-        # Матрица преобразования из координат модели (raw) в реальный camera_link
-        # Слева raw, справа real:
-        # x_raw = z_real  →  z_real = x_raw
-        # y_raw = -x_real →  x_real = -y_raw
-        # z_raw = -y_real →  y_real = -z_raw
+        # Матрица преобразования: координаты модели (raw) -> camera_link
+        # x_raw = z_cam, y_raw = -x_cam, z_raw = -y_cam  =>  x_cam = -y_raw, y_cam = -z_raw, z_cam = x_raw
         self.model_to_camera_rotation = np.array([
-            [ 0, -1,  0],  # x_real = -y_raw
-            [ 0,  0, -1],  # y_real = z_raw
-            [ 1,  0,  0],  # z_real = x_raw
+            [ 0, -1,  0],  # x_cam = -y_raw
+            [ 0,  0, -1],  # y_cam = -z_raw
+            [ 1,  0,  0],  # z_cam = x_raw
         ], dtype=np.float32)
 
-        # ---- TF2 Buffer & Listener ----
+        # ---- TF2 ----
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -125,25 +122,43 @@ class GraspInferenceNode(Node):
         self.device = torch.device("cuda" if use_cuda else "cpu")
         self.get_logger().info(f"Using device: {self.device}")
 
-        # ---- Model ----
-        self.model = GraspNet(use_cuda=use_cuda, num_rotations=self.num_rotations).to(self.device).eval()
+        # ---- Model (same as Trainer(method='base')) ----
+        # IMPORTANT: encoder_weights=None to avoid any downloads; checkpoint overwrites weights anyway.
+        self.model = smp.Unet(
+            encoder_name="resnet18",
+            encoder_weights=None,
+            in_channels=4,
+            classes=1,
+        ).to(self.device).eval()
 
         if model_path and os.path.exists(model_path):
-            state = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(_strip_module_prefix(state), strict=True)
-            self.get_logger().info(f"✓ Loaded model: {model_path}")
+            ckpt = torch.load(model_path, map_location=self.device)
+            q_state = _strip_module_prefix(_extract_q_state(ckpt))
+            self.model.load_state_dict(q_state, strict=True)
+            self.get_logger().info(f"Loaded model: {model_path}")
         else:
-            self.get_logger().warning(f"Model not found: {model_path} (running with random weights)")
+            self.get_logger().error(f"Model not found: {model_path}")
+            raise FileNotFoundError(model_path)
+
+        # ---- Normalization (matches trainer(2).py) ----
+        # resnet18 preprocessing params:
+        # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        # plus depth: mean=0.1, std=0.03
+        mean = torch.tensor([0.485, 0.456, 0.406, 0.1], device=self.device).view(1, 4, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225, 0.03], device=self.device).view(1, 4, 1, 1)
+        self._norm_mean = mean
+        self._norm_std = std
 
         # ---- Publishers ----
         self.pub_q_canvas = self.create_publisher(Image, "~/q_canvas", 10)
-        self.pub_grasp_pose = self.create_publisher(PoseStamped, "~/grasp_pose", 10)
+        self.pub_q_map_raw = self.create_publisher(Image, "~/q_map_raw", 10)
+        self.pub_grasp_pose_camera = self.create_publisher(PoseStamped, "~/grasp_pose", 10)   # camera_link
         self.pub_grasp_pose_base = self.create_publisher(PoseStamped, "~/grasp_pose_base", 10)
         self.pub_grasp_pose_gripper = self.create_publisher(PoseStamped, "~/grasp_pose_gripper", 10)
-        self.pub_grasp_marker = self.create_publisher(Marker, "~/grasp_marker", 10)
-        self.pub_grasp_marker_camera = self.create_publisher(Marker, "~/grasp_marker_camera", 10)
+        self.pub_marker_camera = self.create_publisher(Marker, "~/grasp_marker_camera", 10)    # синий в camera_link
+        self.pub_marker_base = self.create_publisher(Marker, "~/grasp_marker", 10)           # красный в base
 
-        # ---- Subscribers with sync (3 topics) ----
+        # ---- Subscribers (sync 3 topics) ----
         self.sub_color = message_filters.Subscriber(self, Image, color_topic)
         self.sub_height = message_filters.Subscriber(self, Image, height_topic)
         self.sub_mask = message_filters.Subscriber(self, Image, mask_topic)
@@ -151,29 +166,37 @@ class GraspInferenceNode(Node):
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_height, self.sub_mask],
             queue_size=10,
-            slop=sync_slop
+            slop=sync_slop,
         )
         self.ts.registerCallback(self._on_heightmaps)
 
-        # constants
-        self.rgb_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-        self.rgb_std  = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-        self.depth_mean = 0.01
-        self.depth_std = 0.03
+        # ---- EMA state (отключено для дебага: поза без сглаживания) ----
+        # self._ema_pos: np.ndarray | None = None
+        self._ema_pos = None
 
-        # ---- EMA state for pose smoothing ----
-        self._ema_pos: np.ndarray | None = None
-
-        self.get_logger().info("Subscribed to:")
-        self.get_logger().info(f"  color:  {color_topic}")
-        self.get_logger().info(f"  height: {height_topic}")
-        self.get_logger().info(f"  mask:   {mask_topic}")
-        self.get_logger().info(f"Target frame: {self.target_frame}")
-        self.get_logger().info(f"Apply model→camera transform: {self.apply_model_to_camera}")
+        self.get_logger().info(f"Subscribed to: {color_topic} | {height_topic} | {mask_topic}")
         self.get_logger().info(
-            f"Q stabilization: blur_sigma={self.q_blur_sigma}, "
-            f"pose_ema_alpha={self.pose_ema_alpha}"
+            f"hm_size={self.hm_size} res={self.hm_resolution} plane_min={self.plane_min.tolist()} "
+            f"grasp_depth_offset={self.grasp_depth_offset}"
         )
+        # self.get_logger().info(f"stabilization: pose_ema_alpha={self.pose_ema_alpha}")  # отключено для дебага
+        self.get_logger().info(
+            f"target_frame={self.target_frame} | apply_model_to_camera={self.apply_model_to_camera}"
+        )
+
+    def _preprocess(self, color_hm_rgb8: np.ndarray, height_hm: np.ndarray) -> torch.Tensor:
+        """
+        Matches Trainer.forward() for base method:
+            color -> float/255, CHW
+            x = concat(color, depth[None,None])
+            normalize with mean/std (RGB imagenet + depth mean=0.1 std=0.03)
+        """
+        color = torch.from_numpy(color_hm_rgb8).permute(2, 0, 1).unsqueeze(0).float().to(self.device) / 255.0
+        depth = torch.from_numpy(height_hm).unsqueeze(0).unsqueeze(0).float().to(self.device)
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        x = torch.cat([color, depth], dim=1)  # (1,4,H,W)
+        x = (x - self._norm_mean) / self._norm_std
+        return x
 
     @torch.inference_mode()
     def _on_heightmaps(self, color_msg: Image, height_msg: Image, mask_msg: Image):
@@ -188,72 +211,44 @@ class GraspInferenceNode(Node):
         if mask_hm.shape != (self.hm_size, self.hm_size):
             return
 
-        # tensors
-        color = torch.from_numpy(color_hm).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
-        depth = torch.from_numpy(height_hm).unsqueeze(0).unsqueeze(0).float().to(self.device)
-        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # resize 2x
-        H2 = self.hm_size * 2
-        color_2x = F.interpolate(color, size=(H2, H2), mode="bilinear", align_corners=False)
-        depth_2x = F.interpolate(depth, size=(H2, H2), mode="bilinear", align_corners=False)
+        trick_hhm = height_hm / 2 + 0.24
 
-        # pad to diagonal length
-        diag_length = H2 * math.sqrt(2.0)
-        diag_length = int(math.ceil(diag_length / 32.0) * 32.0)
-        padding_width = int((diag_length - H2) / 2)
-        if padding_width > 0:
-            color_2x = F.pad(color_2x, (padding_width,) * 4, mode="constant", value=0.0)
-            depth_2x = F.pad(depth_2x, (padding_width,) * 4, mode="constant", value=0.0)
+        x = self._preprocess(color_hm, trick_hhm)
 
-        input_color = (color_2x / 255.0 - self.rgb_mean) / self.rgb_std
-        input_depth = torch.cat([depth_2x, depth_2x, depth_2x], dim=1)
-        input_depth = (input_depth - self.depth_mean) / self.depth_std
+        # Unet outputs logits -> sigmoid -> q_map in [0,1]
+        logits = self.model(x)            # (1,1,H,W)
+        q = torch.sigmoid(logits)[0, 0]   # (H,W)
 
-        # forward
-        output_prob_list, _ = self.model(input_color, input_depth, specific_rotation=0)
-        output_prob = torch.cat(output_prob_list, dim=0).squeeze(1)
+        q_np = q.detach().cpu().numpy()
 
-        start = int(padding_width / 2)
-        end = int((diag_length / 2) - (padding_width / 2))
-        grasp_pred = output_prob[:, start:end, start:end]
+        # ----- q_map_raw: карта Q ДО наложения маски (полная карта от модели) -----
+        q_uint8 = (np.clip(q_np, 0.0, 1.0) * 255.0).astype(np.uint8)
+        q_colored = cv2.applyColorMap(q_uint8, cv2.COLORMAP_JET)
+        q_raw_msg = self.bridge.cv2_to_imgmsg(q_colored, encoding="bgr8")
+        q_raw_msg.header.stamp = color_msg.header.stamp
+        q_raw_msg.header.frame_id = color_msg.header.frame_id
+        self.pub_q_map_raw.publish(q_raw_msg)
 
-        # valid mask
-        valid = np.isfinite(height_hm)
+        # ----- Наложение маски на Q: обнуляем (отсекаем) ячейки, где mask_hm == 0 -----
+        # Для depth-пайплайна (вариант 2): подписать mask_topic на heightmap_depth/mask (YOLO on image_raw, проекция через наш xyz)
+        print(f"HEIGHT MAP {height_hm[223,112]}")
+
+        valid = np.isfinite(height_hm) & (height_hm != 0)&(height_hm<1)
+        valid[:75, :] = False
         obj = (mask_hm.astype(np.uint8) > 0)
-        if not obj.any():
-            obj = np.ones_like(obj, dtype=bool)
+        # if not obj.any():
+        obj = np.ones_like(obj, dtype=bool)
+        keep = valid & obj
+        if not keep.any():
+            return
 
-        keep = (valid & obj)
-        keep_t = torch.from_numpy(keep).to(self.device).bool().unsqueeze(0)
-        grasp_pred = grasp_pred.masked_fill(~keep_t, -1e9)
+        q_np_masked = q_np.copy()
+        q_np_masked[~keep] = -1e9
 
-        # ---- Gaussian blur on Q-map for stable argmax ----
-        if self.q_blur_sigma > 0:
-            q_for_argmax = grasp_pred.detach().cpu().numpy()
-            for i in range(q_for_argmax.shape[0]):
-                q_slice = q_for_argmax[i]
-                valid_q = q_slice > -1e8
-                if valid_q.any():
-                    blurred = cv2.GaussianBlur(
-                        q_slice, ksize=(0, 0), sigmaX=self.q_blur_sigma,
-                    )
-                    q_slice[valid_q] = blurred[valid_q]
-                q_for_argmax[i] = q_slice
-            grasp_smooth = torch.from_numpy(q_for_argmax).to(self.device)
-        else:
-            grasp_smooth = grasp_pred
-
-        # argmax on smoothed Q
-        R, H, W = grasp_smooth.shape
-        flat_idx = torch.argmax(grasp_smooth)
-        rot = int(flat_idx // (H * W))
-        rem = int(flat_idx % (H * W))
-        row = int(rem // W)
-        col = int(rem % W)
-
-        q_map = grasp_pred.max(dim=0).values
-        q_np = q_map.detach().cpu().numpy()
+        flat_idx = int(np.argmax(q_np_masked))
+        row = flat_idx // self.hm_size
+        col = flat_idx % self.hm_size
 
         # ===== POSE RECONSTRUCTION =====
         x_raw = float(height_hm[row, col] + self.grasp_depth_offset)
@@ -267,23 +262,12 @@ class GraspInferenceNode(Node):
         else:
             x, y, z = x_raw, y_raw, z_raw
 
-        # ---- EMA smoothing on position ----
-        new_pos = np.array([x, y, z], dtype=np.float64)
-        if self._ema_pos is None:
-            self._ema_pos = new_pos
-        else:
-            a = self.pose_ema_alpha
-            self._ema_pos = a * new_pos + (1.0 - a) * self._ema_pos
-
-        x, y, z = float(self._ema_pos[0]), float(self._ema_pos[1]), float(self._ema_pos[2])
-
         self.get_logger().info(
             f"RAW=({x_raw:.3f},{y_raw:.3f},{z_raw:.3f}) "
-            f"EMA=({x:.3f},{y:.3f},{z:.3f}) "
+            f"CAM=({x:.3f},{y:.3f},{z:.3f}) "
             f"pixel=({row},{col})"
         )
 
-        # Создаем PoseStamped в camera_link
         pose_camera = PoseStamped()
         pose_camera.header.stamp = color_msg.header.stamp
         pose_camera.header.frame_id = color_msg.header.frame_id
@@ -291,128 +275,50 @@ class GraspInferenceNode(Node):
         pose_camera.pose.position.y = y
         pose_camera.pose.position.z = z
         pose_camera.pose.orientation.w = 1.0
-        
-        # Публикуем в camera_link
-        self.pub_grasp_pose.publish(pose_camera)
-        
-        # Маркер в camera_link (СИНИЙ)
-        marker_camera = Marker()
-        marker_camera.header = pose_camera.header
-        marker_camera.ns = "grasp_point_camera"
-        marker_camera.id = 1
-        marker_camera.type = Marker.SPHERE
-        marker_camera.action = Marker.ADD
-        marker_camera.pose = pose_camera.pose
-        marker_camera.scale.x = 0.05
-        marker_camera.scale.y = 0.05
-        marker_camera.scale.z = 0.05
-        marker_camera.color.r = 0.0
-        marker_camera.color.g = 0.0
-        marker_camera.color.b = 1.0
-        marker_camera.color.a = 1.0
-        marker_camera.lifetime = Duration(seconds=2.0).to_msg()
-        self.pub_grasp_marker_camera.publish(marker_camera)
+        self.pub_grasp_pose_camera.publish(pose_camera)
 
-        # ===== ТРАНСФОРМАЦИЯ в base_link =====
+        # ===== TF: camera_link -> base =====
         try:
-            # Используем последнюю доступную трансформацию
             transform = self.tf_buffer.lookup_transform(
                 self.target_frame,
                 pose_camera.header.frame_id,
-                Time(),  # последняя доступная
-                timeout=Duration(seconds=self.transform_timeout)
+                Time(),
+                timeout=Duration(seconds=self.transform_timeout),
             )
-            
-            # Применяем трансформацию
             pose_base = tf2_geometry_msgs.do_transform_pose_stamped(pose_camera, transform)
-            
-            # Публикуем преобразованную позу
             self.pub_grasp_pose_base.publish(pose_base)
-            
 
-
-            #Covnvert from tool0_controlller(tcp) to real gripper
             pose_gripper = PoseStamped()
             pose_gripper.header = pose_base.header
-
-            pose_gripper.pose.position.x = pose_base.pose.position.x
-            pose_gripper.pose.position.y = pose_base.pose.position.y
-            pose_gripper.pose.position.z = pose_base.pose.position.z
-
+            pose_gripper.pose.position.x = pose_base.pose.position.x + (-0.096)
+            pose_gripper.pose.position.y = pose_base.pose.position.y + 0.008
+            pose_gripper.pose.position.z = pose_base.pose.position.z + (-0.12)
             pose_gripper.pose.orientation.x = pose_base.pose.orientation.x
             pose_gripper.pose.orientation.y = pose_base.pose.orientation.y
             pose_gripper.pose.orientation.z = pose_base.pose.orientation.z
             pose_gripper.pose.orientation.w = pose_base.pose.orientation.w
-
-
-            # смещение в системе base (!)
-            pose_gripper.pose.position.x += -0.026
-            pose_gripper.pose.position.z += -0.12
-            pose_gripper.pose.position.y += 0.008
-
-
-
-            # публикуем доп. позу
             self.pub_grasp_pose_gripper.publish(pose_gripper)
 
-            # лог
             self.get_logger().info(
                 f"[TF] tcp:     x={pose_base.pose.position.x:.3f} "
                 f"y={pose_base.pose.position.y:.3f} z={pose_base.pose.position.z:.3f}\n"
                 f"[TF] gripper: x={pose_gripper.pose.position.x:.3f} "
                 f"y={pose_gripper.pose.position.y:.3f} z={pose_gripper.pose.position.z:.3f}"
             )
-
-
-
-            
-            # ===== ВИЗУАЛИЗАЦИЯ МАРКЕРА в base_link =====
-            marker = Marker()
-            marker.header = pose_base.header
-            marker.ns = "grasp_point"
-            marker.id = 0
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            
-            # Позиция
-            marker.pose = pose_base.pose
-            
-            # Размер (5см сфера)
-            marker.scale.x = 0.05
-            marker.scale.y = 0.05
-            marker.scale.z = 0.05
-            
-            # Цвет (КРАСНЫЙ - после трансформации)
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker.color.a = 1.0
-            
-            # Время жизни
-            marker.lifetime = Duration(seconds=2.0).to_msg()
-            
-            self.pub_grasp_marker.publish(marker)
-            
-            self.get_logger().info(
-                f"🎯 best rot={rot}/{self.num_rotations} | pixel=({row},{col})\n"
-                f"   RAW model: x={x_raw:.3f}, y={y_raw:.3f}, z={z_raw:.3f}\n"
-                f"   {pose_camera.header.frame_id}: x={x:.3f}, y={y:.3f}, z={z:.3f}\n"
-                f"   {self.target_frame}: x={pose_base.pose.position.x:.3f}, "
-                f"y={pose_base.pose.position.y:.3f}, z={pose_base.pose.position.z:.3f}\n"
-                f"   Transform: tx={transform.transform.translation.x:.3f}, "
-                f"ty={transform.transform.translation.y:.3f}, tz={transform.transform.translation.z:.3f}"
-            )
-            
         except Exception as e:
-            self.get_logger().error(f"Failed to transform pose: {e}")
+            self.get_logger().error(f"TF transform failed: {e}")
 
-        # ===== Q CANVAS =====
-        q_norm = q_np - np.nanmin(q_np)
-        q_max = np.nanmax(q_norm)
-        if q_max > 1e-12:
-            q_norm = q_norm / q_max
-        q_img = (np.clip(q_norm, 0.0, 1.0) * 255.0).astype(np.uint8)
+        # ===== Q canvas: карта Q ПОСЛЕ маски (только объект) + точка грипа =====
+        q_vis = q_np.copy()
+        q_vis[~keep] = np.nan
+        vmin = np.nanmin(q_vis)
+        vmax = np.nanmax(q_vis)
+        if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
+            q_norm = (q_vis - vmin) / (vmax - vmin)
+        else:
+            q_norm = np.zeros_like(q_np, dtype=np.float32)
 
+        q_img = (np.nan_to_num(q_norm, nan=0.0) * 255.0).astype(np.uint8)
         heatmap = cv2.applyColorMap(q_img, cv2.COLORMAP_JET)
         heatmap = cv2.circle(heatmap, (col, row), 6, (0, 0, 255), 2)
 
