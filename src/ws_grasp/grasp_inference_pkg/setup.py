@@ -26,6 +26,7 @@ setup(
         "console_scripts": [
             "grasp_node = grasp_inference_pkg.grasp_node:main",
             "model_forward = grasp_inference_pkg.model_forward:main",
+            "new_model = grasp_inference_pkg.new_model:main",
             "gripper_exec = grasp_inference_pkg.gripper_exec:main",
         ],
     },

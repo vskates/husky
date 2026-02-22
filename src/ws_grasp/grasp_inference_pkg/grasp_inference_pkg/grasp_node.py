@@ -128,8 +128,8 @@ class HeightmapNode(Node):
 
         self.declare_parameter("hm_size", 224)
         self.declare_parameter("hm_resolution", 0.001)
-        self.declare_parameter("plane_min", [-0.224, -0.224])
-        self.declare_parameter("plane_max", [0.224, 0.224])
+        self.declare_parameter("plane_min", [0.438, 0.888])
+        self.declare_parameter("plane_max", [0.662, 1.112])
 
         self.declare_parameter("out_prefix", "heightmap")
         self.declare_parameter("fallback_optical_to_link", True)
