@@ -17,21 +17,23 @@ class GripperExecNode(Node):
         self.declare_parameter("urscript_topic", "/ur5_/urscript_interface/script_command")
         self.declare_parameter("gripper_target_topic", "/gripper/target_position")
         self.declare_parameter("gripper_current_topic", "/gripper/current_position")
-        self.declare_parameter("move_acceleration", 0.05)
-        self.declare_parameter("move_velocity", 0.05)
+        self.declare_parameter("move_acceleration", 0.07)
+        self.declare_parameter("move_velocity", 0.07)
         self.declare_parameter("move_radius", 0.0)
         self.declare_parameter("gripper_close_position", 100.0)
         self.declare_parameter("gripper_open_position", 0.0)
         self.declare_parameter("auto_execute", True)
-        self.declare_parameter("wait_after_move", 1.0)
+        self.declare_parameter("wait_after_move", 2.0)
         self.declare_parameter("wait_after_grip", 1.5)
-        self.declare_parameter("pre_grasp_offset_y", 0.08)
+        self.declare_parameter("pre_grasp_offset_y", 0.07)
         self.declare_parameter("lift_height", 0.08)
 
         # home_position: [x, y, z, rx, ry, rz] в координатах base (для movep)
         self.declare_parameter("home_position", [0.103, -0.302, 0.306, 0.002, 2.301, -2.172])
         self.declare_parameter("left_right_delta", 0.05)
         self.declare_parameter("above_home_height", 0.15)
+        # для левой стороны: преграсп только если y < left_pregrasp_min_y (глубина достаточная)
+        self.declare_parameter("left_pregrasp_min_y", -0.61)
 
         # читаем параметры
         grasp_topic = self.get_parameter("grasp_pose_topic").value
@@ -57,6 +59,7 @@ class GripperExecNode(Node):
         self.home_pos = [float(v) for v in home_raw]
         self.left_right_delta = float(self.get_parameter("left_right_delta").value)
         self.above_home_height = float(self.get_parameter("above_home_height").value)
+        self.left_pregrasp_min_y = float(self.get_parameter("left_pregrasp_min_y").value)
 
         # ===== Состояние =====
         self.latest_grasp_pose: PoseStamped | None = None
@@ -89,6 +92,7 @@ class GripperExecNode(Node):
         self.get_logger().info(f"  above_home_height: {self.above_home_height} m")
         self.get_logger().info(f"  left_right_delta: {self.left_right_delta}")
         self.get_logger().info(f"  pre_grasp_offset_y: {self.pre_grasp_y}")
+        self.get_logger().info(f"  left_pregrasp_min_y: {self.left_pregrasp_min_y}")
         self.get_logger().info("Waiting for grasp pose...")
 
     # ===== callbacks =====
@@ -131,13 +135,20 @@ class GripperExecNode(Node):
         hrx, hry, hrz = self.home_pos[3], self.home_pos[4], self.home_pos[5]
 
         is_left = (gx - hx) > self.left_right_delta
+        # Справа — всегда преграсп. Слева — только если глубина достаточная (y < left_pregrasp_min_y)
+        do_pregrasp = (not is_left) or (gy < self.left_pregrasp_min_y)
 
         self.is_executing = True
+        t_start = time.perf_counter()
 
         self.get_logger().info("")
         self.get_logger().info(f"  Grasp target: x={gx:.3f}, y={gy:.3f}, z={gz:.3f}")
         self.get_logger().info(f"  Home:         x={hx:.3f}, y={hy:.3f}, z={hz:.3f}")
-        self.get_logger().info(f"  Side: {'LEFT (no pre-grasp)' if is_left else 'RIGHT (with pre-grasp)'}")
+        side_msg = "RIGHT (pre-grasp)" if not is_left else (
+            "LEFT, pre-grasp (y < {:.2f})".format(self.left_pregrasp_min_y) if do_pregrasp
+            else "LEFT, no pre-grasp (y >= {:.2f})".format(self.left_pregrasp_min_y)
+        )
+        self.get_logger().info(f"  Side: {side_msg}")
         self.get_logger().info("")
 
         try:
@@ -150,10 +161,9 @@ class GripperExecNode(Node):
             # === 2. Open gripper ===
             self.get_logger().info("[2/9] Opening gripper...")
             self._open_gripper()
-            time.sleep(self.wait_grip)
 
-            # === 3. Pre-grasp (only for RIGHT positions) ===
-            if not is_left:
+            # === 3. Pre-grasp (RIGHT всегда; LEFT только при y < left_pregrasp_min_y) ===
+            if do_pregrasp:
                 pre_y = gy + self.pre_grasp_y
                 pre = [gx, pre_y, gz, hrx, hry, hrz]
                 self.get_logger().info(
@@ -162,9 +172,8 @@ class GripperExecNode(Node):
                 self._move_to_xyzrpy(pre, "pre-grasp")
                 self._wait_until_reached_xyz(gx, pre_y, gz)
                 self.get_logger().info("[3/9] Reached pre-grasp")
-                time.sleep(3.0)
             else:
-                self.get_logger().info("[3/9] LEFT side — skipping pre-grasp")
+                self.get_logger().info("[3/9] LEFT and y >= {:.2f} — skipping pre-grasp".format(self.left_pregrasp_min_y))
 
             # === 4. Move to grasp ===
             grasp = [gx, gy, gz, hrx, hry, hrz]
@@ -178,7 +187,7 @@ class GripperExecNode(Node):
             # === 5. Close gripper ===
             self.get_logger().info("[5/9] Closing gripper...")
             self._close_gripper()
-            time.sleep(3.0)
+            time.sleep(2.0)
             self.get_logger().info("[5/9] Gripper closed")
 
             # === 6. Lift ===
@@ -204,19 +213,21 @@ class GripperExecNode(Node):
             self.get_logger().info("[8/9] Reached home")
 
             # === 9. Done ===
+            elapsed = time.perf_counter() - t_start
             self.get_logger().info("")
-            self.get_logger().info("[9/9] GRASP SEQUENCE COMPLETED")
+            self.get_logger().info(f"[9/9] GRASP SEQUENCE COMPLETED in {elapsed:.2f} s")
             self.get_logger().info("")
             time.sleep(1.0)
             self._open_gripper()
 
-
         except Exception as e:
-            self.get_logger().error(f"EXECUTION FAILED: {e}")
+            elapsed = time.perf_counter() - t_start
+            self.get_logger().error(f"EXECUTION FAILED after {elapsed:.2f} s: {e}")
 
         finally:
             self.is_executing = False
-            self.get_logger().info("State unlocked (one-shot finished)")
+            elapsed_total = time.perf_counter() - t_start
+            self.get_logger().info(f"State unlocked (one-shot finished, total {elapsed_total:.2f} s)")
 
     # ===== movement helpers =====
 
@@ -237,7 +248,7 @@ class GripperExecNode(Node):
             f"  URScript sent: p[{x:.3f}, {y:.3f}, {z:.3f}, {rx:.3f}, {ry:.3f}, {rz:.3f}] ({label})"
         )
 
-    def _wait_until_reached_xyz(self, tx: float, ty: float, tz: float, pos_tol: float = 0.03):
+    def _wait_until_reached_xyz(self, tx: float, ty: float, tz: float, pos_tol: float = 0.001):
         log_counter = 0
         while rclpy.ok():
             if self.current_tcp_pose is None:
