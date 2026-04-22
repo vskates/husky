@@ -94,3 +94,40 @@ def build_heightmaps(
         mask_hm[py, px] = m
 
     return color_hm, height_hm, mask_hm
+
+
+def depth_to_xyz(
+    depth: np.ndarray,
+    intrinsic_matrix: np.ndarray,
+    frame_optical_to_link: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Unproject a depth image into an XYZ map in meters."""
+    if depth.ndim != 2:
+        raise ValueError(f"depth must be HxW, got shape {depth.shape}")
+
+    k = np.asarray(intrinsic_matrix, dtype=np.float64).reshape(3, 3)
+    fx = float(k[0, 0])
+    fy = float(k[1, 1])
+    cx = float(k[0, 2])
+    cy = float(k[1, 2])
+    if fx == 0.0 or fy == 0.0:
+        raise ValueError("intrinsic matrix has zero focal length")
+
+    h, w = depth.shape
+    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    z = np.asarray(depth, dtype=np.float32)
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    xyz = np.stack([x, y, z], axis=-1)
+
+    valid = np.isfinite(z) & (z > 0.0)
+    xyz[~valid] = np.nan
+
+    if frame_optical_to_link is not None:
+        rotation, translation = frame_optical_to_link
+        xyz_flat = xyz.reshape(-1, 3)
+        finite = np.isfinite(xyz_flat).all(axis=1)
+        xyz_flat[finite] = (xyz_flat[finite] @ rotation.T) + translation[None, :]
+        xyz = xyz_flat.reshape(h, w, 3)
+
+    return xyz.astype(np.float32, copy=False)
