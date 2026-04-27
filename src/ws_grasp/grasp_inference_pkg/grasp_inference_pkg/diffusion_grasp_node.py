@@ -128,8 +128,6 @@ class DiffusionGraspNode(Node):
         self.declare_parameter("remove_outliers", True)
         self.declare_parameter("min_points", 20)
         self.declare_parameter("max_points", 2048)
-        self.declare_parameter("point_cloud_noise_std", 0.001)
-        self.declare_parameter("point_cloud_noise_clip", 0.003)
         self.declare_parameter("min_inference_interval_sec", 0.0)
         self.declare_parameter("candidate_count_to_publish", 20)
         self.declare_parameter("gripper_translation_offset", [-0.096, 0.008, -0.12])
@@ -155,8 +153,6 @@ class DiffusionGraspNode(Node):
         self.remove_outliers = bool(self.get_parameter("remove_outliers").value)
         self.min_points = int(self.get_parameter("min_points").value)
         self.max_points = int(self.get_parameter("max_points").value)
-        self.point_cloud_noise_std = float(self.get_parameter("point_cloud_noise_std").value)
-        self.point_cloud_noise_clip = float(self.get_parameter("point_cloud_noise_clip").value)
         self.min_inference_interval_sec = float(self.get_parameter("min_inference_interval_sec").value)
         self.candidate_count_to_publish = int(self.get_parameter("candidate_count_to_publish").value)
 
@@ -172,7 +168,6 @@ class DiffusionGraspNode(Node):
             float(gripper_rpy_offset[2]),
         )
         self.gripper_offset[:3, 3] = gripper_translation_offset
-        self._rng = np.random.default_rng()
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -192,8 +187,7 @@ class DiffusionGraspNode(Node):
         self.get_logger().info(
             f"Diffusion grasp node ready: topic={self.pointcloud_topic} backend={self._backend_kind} "
             f"inference_frame={self.inference_frame or '[cloud]'} "
-            f"base_frame={self.robot_base_frame} camera_frame={self.camera_frame} "
-            f"noise_std={self.point_cloud_noise_std:.4f} noise_clip={self.point_cloud_noise_clip:.4f}"
+            f"base_frame={self.robot_base_frame} camera_frame={self.camera_frame}"
         )
 
     def _setup_backend(self) -> None:
@@ -323,13 +317,6 @@ class DiffusionGraspNode(Node):
 
         center = points.mean(axis=0).astype(np.float32)
         normalized_points = (points - center[None, :]).astype(np.float32, copy=False)
-        if self.point_cloud_noise_std > 0.0:
-            noise = self._rng.normal(0.0, self.point_cloud_noise_std, size=normalized_points.shape).astype(np.float32)
-            normalized_points = normalized_points + np.clip(
-                noise,
-                -self.point_cloud_noise_clip,
-                self.point_cloud_noise_clip,
-            ).astype(np.float32, copy=False)
 
         if self.max_points > 0 and normalized_points.shape[0] > self.max_points:
             choice = np.linspace(0, points.shape[0] - 1, self.max_points, dtype=np.int64)

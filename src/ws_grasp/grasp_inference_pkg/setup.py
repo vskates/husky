@@ -35,6 +35,8 @@ setup(
             "model_forward = grasp_inference_pkg.model_forward:main",
             "segmented_object_pcd_node = grasp_inference_pkg.segmented_object_pcd_node:main",
             "diffusion_grasp_node = grasp_inference_pkg.diffusion_grasp_node:main",
+            "yolo_mask_publisher = grasp_inference_pkg.yolo_mask_publisher:main",
+            "bag_frame_publisher = grasp_inference_pkg.bag_frame_publisher:main",
             "gripper_exec = grasp_inference_pkg.gripper_exec:main",
         ],
     },
