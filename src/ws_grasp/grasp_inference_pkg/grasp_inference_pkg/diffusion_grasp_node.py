@@ -116,7 +116,7 @@ class DiffusionGraspNode(Node):
         self.declare_parameter("backend_mode", "auto")
         self.declare_parameter("graspgen_repo_path", "/home/weshi/graspgen")
         self.declare_parameter("gripper_config", "/home/weshi/graspgen/GraspGenModels/checkpoints/graspgen_astribot.yml")
-        self.declare_parameter("conda_env_name", "graspgen-infer")
+        self.declare_parameter("conda_env_name", "isaaclab")
         self.declare_parameter("conda_executable", "")
         self.declare_parameter("subprocess_timeout_sec", 120.0)
         self.declare_parameter("force_cpu", False)
