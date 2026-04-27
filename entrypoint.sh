@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+# install/setup.bash может отсутствовать в свежем контейнере до первой сборки
 # Подгружаем ROS 2
 source /opt/ros/humble/setup.bash
 
