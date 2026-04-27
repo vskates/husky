@@ -4,9 +4,9 @@
 
 - `segmented_object_pcd_node`:
   - input: `depth + camera_info + mask`
-  - output: segmented object `PointCloud2`
+  - output: segmented object `PointCloud2` in `camera_link`
 - `diffusion_grasp_node`:
-  - input: segmented object `PointCloud2`
+  - input: segmented object `PointCloud2` in 3D camera coordinates
   - output: `grasp_pose`, `grasp_pose_base`, `grasp_pose_gripper`, `grasp_candidates`, `best_score`
 
 ## Launch
@@ -55,4 +55,5 @@ ros2 bag play <bag_path> --clock
 
 - `mask_topic` in the launch file should be changed to your real mask topic from the bag.
 - This setup builds the segmented object cloud from depth, camera intrinsics, and mask.
+- In the default launch, inference runs on the `camera_link` cloud and also republishes the best grasp in `base`.
 - `grasp_pose_gripper` is computed with a full 6DoF offset transform, not only XYZ translation.

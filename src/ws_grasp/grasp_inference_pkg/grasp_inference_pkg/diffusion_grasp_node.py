@@ -16,7 +16,6 @@ from rclpy.time import Time
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32
-import tf2_geometry_msgs
 from tf2_ros import Buffer, TransformListener
 
 from .pointcloud_ros import (
@@ -101,6 +100,7 @@ class DiffusionGraspNode(Node):
         super().__init__("diffusion_grasp_node")
 
         self.declare_parameter("pointcloud_topic", "/segmented_object_pcd_node/points")
+        self.declare_parameter("inference_frame", "")
         self.declare_parameter("robot_base_frame", "base")
         self.declare_parameter("camera_frame", "camera_link")
         self.declare_parameter("transform_timeout", 0.5)
@@ -125,6 +125,7 @@ class DiffusionGraspNode(Node):
         self.declare_parameter("gripper_rpy_offset", [0.0, 0.0, 0.0])
 
         self.pointcloud_topic = str(self.get_parameter("pointcloud_topic").value)
+        self.inference_frame = normalize_frame_id(str(self.get_parameter("inference_frame").value))
         self.robot_base_frame = normalize_frame_id(str(self.get_parameter("robot_base_frame").value))
         self.camera_frame = normalize_frame_id(str(self.get_parameter("camera_frame").value))
         self.transform_timeout = float(self.get_parameter("transform_timeout").value)
@@ -176,6 +177,7 @@ class DiffusionGraspNode(Node):
 
         self.get_logger().info(
             f"Diffusion grasp node ready: topic={self.pointcloud_topic} backend={self._backend_kind} "
+            f"inference_frame={self.inference_frame or '[cloud]'} "
             f"base_frame={self.robot_base_frame} camera_frame={self.camera_frame}"
         )
 
@@ -239,7 +241,8 @@ class DiffusionGraspNode(Node):
             return
 
         cloud_frame = normalize_frame_id(msg.header.frame_id)
-        points, inference_frame = self._transform_points_to_base(points, cloud_frame, Time.from_msg(msg.header.stamp))
+        stamp = Time.from_msg(msg.header.stamp)
+        points, inference_frame = self._prepare_points_for_inference(points, cloud_frame, stamp)
         if points.shape[0] < self.min_points:
             self.get_logger().warning(
                 f"Too few valid object points for inference: {points.shape[0]} < {self.min_points}"
@@ -256,9 +259,9 @@ class DiffusionGraspNode(Node):
         best_score = float(result.scores[best_index])
         gripper_pose = best_grasp @ self.gripper_offset
 
-        self._publish_pose(self.pub_grasp_pose_base, best_grasp, inference_frame, msg.header.stamp)
-        self._publish_pose(self.pub_grasp_pose_gripper, gripper_pose, inference_frame, msg.header.stamp)
         self._publish_camera_pose(best_grasp, inference_frame, msg.header.stamp)
+        self._publish_base_pose(self.pub_grasp_pose_base, best_grasp, inference_frame, msg.header.stamp)
+        self._publish_base_pose(self.pub_grasp_pose_gripper, gripper_pose, inference_frame, msg.header.stamp)
         self._publish_candidates(result, inference_frame, msg.header.stamp)
 
         score_msg = Float32()
@@ -270,21 +273,21 @@ class DiffusionGraspNode(Node):
             f"Published best grasp score={best_score:.4f} total_candidates={result.grasps.shape[0]}"
         )
 
-    def _transform_points_to_base(self, points: np.ndarray, source_frame: str, stamp: Time) -> tuple[np.ndarray, str]:
+    def _prepare_points_for_inference(self, points: np.ndarray, source_frame: str, stamp: Time) -> tuple[np.ndarray, str]:
         valid = np.isfinite(points).all(axis=1) & (np.linalg.norm(points, axis=1) > 1e-6)
         points = points[valid]
         if points.shape[0] == 0:
-            return points.astype(np.float32), self.robot_base_frame or source_frame
+            return points.astype(np.float32), self._resolve_inference_frame(source_frame)
 
-        frame_id = self.robot_base_frame or source_frame
-        if self.robot_base_frame and source_frame and source_frame != self.robot_base_frame:
+        frame_id = self._resolve_inference_frame(source_frame)
+        if frame_id and source_frame and source_frame != frame_id:
             try:
-                transform = self._lookup_transform(self.robot_base_frame, source_frame, stamp)
+                transform = self._lookup_transform(frame_id, source_frame, stamp)
                 transform_matrix = transform_to_matrix(transform)
                 points = apply_transform(points, transform_matrix)
             except Exception as exc:
                 self.get_logger().warning(
-                    f"Could not transform point cloud {source_frame} -> {self.robot_base_frame}: {exc}. "
+                    f"Could not transform point cloud {source_frame} -> {frame_id}: {exc}. "
                     "Running inference in source frame."
                 )
                 frame_id = source_frame
@@ -296,6 +299,9 @@ class DiffusionGraspNode(Node):
             points = points[choice]
 
         return points.astype(np.float32, copy=False), frame_id
+
+    def _resolve_inference_frame(self, source_frame: str) -> str:
+        return self.inference_frame or source_frame or self.robot_base_frame
 
     def _run_inference(self, points: np.ndarray) -> InferenceResult:
         if self._backend_kind == "python":
@@ -385,18 +391,53 @@ class DiffusionGraspNode(Node):
             self._publish_pose(self.pub_grasp_pose_camera, pose_base, pose_frame, stamp)
             return
 
-        pose_base_msg = PoseStamped()
-        pose_base_msg.header.frame_id = pose_frame
-        pose_base_msg.header.stamp = stamp
-        pose_base_msg.pose = matrix_to_pose(pose_base)
         try:
-            transform = self._lookup_transform(self.camera_frame, pose_frame, Time.from_msg(stamp))
-            pose_camera = tf2_geometry_msgs.do_transform_pose_stamped(pose_base_msg, transform)
-            self.pub_grasp_pose_camera.publish(pose_camera)
+            pose_camera = self._transform_pose_matrix(
+                pose_base,
+                source_frame=pose_frame,
+                target_frame=self.camera_frame,
+                stamp=Time.from_msg(stamp),
+            )
+            self._publish_pose(self.pub_grasp_pose_camera, pose_camera, self.camera_frame, stamp)
         except Exception as exc:
             self.get_logger().warning(
                 f"Could not publish camera-frame grasp pose ({pose_frame} -> {self.camera_frame}): {exc}"
             )
+
+    def _publish_base_pose(self, publisher, pose_matrix: np.ndarray, pose_frame: str, stamp) -> None:
+        target_frame = self.robot_base_frame or pose_frame
+        if not target_frame:
+            return
+        if target_frame == pose_frame:
+            self._publish_pose(publisher, pose_matrix, pose_frame, stamp)
+            return
+
+        try:
+            pose_base = self._transform_pose_matrix(
+                pose_matrix,
+                source_frame=pose_frame,
+                target_frame=target_frame,
+                stamp=Time.from_msg(stamp),
+            )
+            self._publish_pose(publisher, pose_base, target_frame, stamp)
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Could not publish base-frame grasp pose ({pose_frame} -> {target_frame}): {exc}"
+            )
+
+    def _transform_pose_matrix(
+        self,
+        pose_matrix: np.ndarray,
+        source_frame: str,
+        target_frame: str,
+        stamp: Time,
+    ) -> np.ndarray:
+        if not source_frame or not target_frame or source_frame == target_frame:
+            return pose_matrix.astype(np.float32, copy=False)
+
+        transform = self._lookup_transform(target_frame, source_frame, stamp)
+        transform_matrix = transform_to_matrix(transform)
+        return (transform_matrix @ pose_matrix).astype(np.float32, copy=False)
 
     def _publish_candidates(self, result: InferenceResult, frame_id: str, stamp) -> None:
         if result.grasps.shape[0] == 0:

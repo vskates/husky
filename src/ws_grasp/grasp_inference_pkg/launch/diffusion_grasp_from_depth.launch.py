@@ -15,7 +15,7 @@ def generate_launch_description():
                         "depth_topic": "/camera/camera/aligned_depth_to_color/image_rect_raw",
                         "camera_info_topic": "/camera/camera/aligned_depth_to_color/camera_info",
                         "mask_topic": "/object_mask",
-                        "target_frame": "base",
+                        "target_frame": "camera_link",
                         "publish_full_cloud": False,
                     }
                 ],
@@ -28,6 +28,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "pointcloud_topic": "/segmented_object_pcd_node/points",
+                        "inference_frame": "camera_link",
                         "robot_base_frame": "base",
                         "camera_frame": "camera_link",
                         "backend_mode": "auto",

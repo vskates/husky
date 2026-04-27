@@ -18,9 +18,9 @@ Pipeline:
 
 - `segmented_object_pcd_node`
   - input: depth image, camera info, binary object mask
-  - output: segmented object `PointCloud2`
+  - output: segmented object `PointCloud2` in `camera_link`
 - `diffusion_grasp_node`
-  - input: segmented object `PointCloud2`
+  - input: segmented object `PointCloud2` in 3D camera coordinates
   - output:
     - `/diffusion_grasp_node/grasp_pose`
     - `/diffusion_grasp_node/grasp_pose_base`
@@ -74,6 +74,7 @@ ros2 bag play <bag_path> --clock
 ## Notes
 
 - The segmented point cloud is built from depth, intrinsics, and mask.
+- By default the segmented point cloud is published in `camera_link`, while `grasp_pose_base` and `grasp_pose_gripper` are published in `base`.
 - `grasp_pose_gripper` is computed with a full 6DoF transform offset.
 - The diffusion backend uses `~/graspgen` and prefers the `graspgen-infer` conda environment.
 
