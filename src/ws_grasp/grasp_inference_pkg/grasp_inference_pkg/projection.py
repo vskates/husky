@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 
@@ -8,8 +8,12 @@ class HeightmapSpec:
     size: int = 224
     resolution: float = 0.002  # meters per pixel
     # bounds for the 2 plane axes in the POINT FRAME (camera_frame or base_link), meters:
-    plane_min: np.ndarray = np.array([-0.2, -0.2], dtype=np.float32)  # [u_min, v_min]
-    plane_max: np.ndarray = np.array([ 0.2,  0.2], dtype=np.float32)  # [u_max, v_max]
+    plane_min: np.ndarray = field(
+        default_factory=lambda: np.array([-0.2, -0.2], dtype=np.float32)
+    )  # [u_min, v_min]
+    plane_max: np.ndarray = field(
+        default_factory=lambda: np.array([0.2, 0.2], dtype=np.float32)
+    )  # [u_max, v_max]
 
     # mapping: which coordinates of XYZ are height axis and plane axes
     # default assumes points are already in a frame where:
