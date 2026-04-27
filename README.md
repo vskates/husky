@@ -74,7 +74,8 @@ ros2 bag play <bag_path> --clock
 ## Notes
 
 - The segmented point cloud is built from depth, intrinsics, and mask.
-- By default the segmented point cloud is published in `camera_link`, while `grasp_pose_base` and `grasp_pose_gripper` are published in `base`.
+- Before inference, the ROS node recenters the point cloud around its mean like the `MetaIsaacGrasp` remote pipeline and restores grasps back to the input `PointCloud2` frame afterwards.
+- By default the segmented point cloud is published in `camera_link`, `grasp_pose` and `grasp_candidates` stay in the input cloud frame, while `grasp_pose_base` and `grasp_pose_gripper` are published in `base`.
 - `grasp_pose_gripper` is computed with a full 6DoF transform offset.
 - The diffusion backend uses `~/graspgen` and prefers the `graspgen-infer` conda environment.
 

@@ -55,5 +55,6 @@ ros2 bag play <bag_path> --clock
 
 - `mask_topic` in the launch file should be changed to your real mask topic from the bag.
 - This setup builds the segmented object cloud from depth, camera intrinsics, and mask.
-- In the default launch, inference runs on the `camera_link` cloud and also republishes the best grasp in `base`.
+- Before inference, the node recenters the point cloud around its mean the same way as the `MetaIsaacGrasp` remote pipeline, then restores predicted grasps back to the input cloud frame.
+- In the default launch, inference runs on the `camera_link` cloud, `grasp_pose` stays in the input point cloud frame, and the node also republishes the best grasp in `base`.
 - `grasp_pose_gripper` is computed with a full 6DoF offset transform, not only XYZ translation.

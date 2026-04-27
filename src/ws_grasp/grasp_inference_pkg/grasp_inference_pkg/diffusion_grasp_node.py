@@ -32,6 +32,15 @@ class InferenceResult:
     scores: np.ndarray
 
 
+@dataclass
+class PreparedPointCloud:
+    normalized_points: np.ndarray
+    source_frame: str
+    inference_frame: str
+    center: np.ndarray
+    source_from_inference: np.ndarray | None
+
+
 def rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
     trace = float(rotation[0, 0] + rotation[1, 1] + rotation[2, 2])
     if trace > 0.0:
@@ -119,6 +128,8 @@ class DiffusionGraspNode(Node):
         self.declare_parameter("remove_outliers", True)
         self.declare_parameter("min_points", 20)
         self.declare_parameter("max_points", 2048)
+        self.declare_parameter("point_cloud_noise_std", 0.001)
+        self.declare_parameter("point_cloud_noise_clip", 0.003)
         self.declare_parameter("min_inference_interval_sec", 0.0)
         self.declare_parameter("candidate_count_to_publish", 20)
         self.declare_parameter("gripper_translation_offset", [-0.096, 0.008, -0.12])
@@ -144,6 +155,8 @@ class DiffusionGraspNode(Node):
         self.remove_outliers = bool(self.get_parameter("remove_outliers").value)
         self.min_points = int(self.get_parameter("min_points").value)
         self.max_points = int(self.get_parameter("max_points").value)
+        self.point_cloud_noise_std = float(self.get_parameter("point_cloud_noise_std").value)
+        self.point_cloud_noise_clip = float(self.get_parameter("point_cloud_noise_clip").value)
         self.min_inference_interval_sec = float(self.get_parameter("min_inference_interval_sec").value)
         self.candidate_count_to_publish = int(self.get_parameter("candidate_count_to_publish").value)
 
@@ -159,10 +172,11 @@ class DiffusionGraspNode(Node):
             float(gripper_rpy_offset[2]),
         )
         self.gripper_offset[:3, 3] = gripper_translation_offset
+        self._rng = np.random.default_rng()
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.pub_grasp_pose_camera = self.create_publisher(PoseStamped, "~/grasp_pose", 10)
+        self.pub_grasp_pose = self.create_publisher(PoseStamped, "~/grasp_pose", 10)
         self.pub_grasp_pose_base = self.create_publisher(PoseStamped, "~/grasp_pose_base", 10)
         self.pub_grasp_pose_gripper = self.create_publisher(PoseStamped, "~/grasp_pose_gripper", 10)
         self.pub_grasp_candidates = self.create_publisher(PoseArray, "~/grasp_candidates", 10)
@@ -178,7 +192,8 @@ class DiffusionGraspNode(Node):
         self.get_logger().info(
             f"Diffusion grasp node ready: topic={self.pointcloud_topic} backend={self._backend_kind} "
             f"inference_frame={self.inference_frame or '[cloud]'} "
-            f"base_frame={self.robot_base_frame} camera_frame={self.camera_frame}"
+            f"base_frame={self.robot_base_frame} camera_frame={self.camera_frame} "
+            f"noise_std={self.point_cloud_noise_std:.4f} noise_clip={self.point_cloud_noise_clip:.4f}"
         )
 
     def _setup_backend(self) -> None:
@@ -242,27 +257,29 @@ class DiffusionGraspNode(Node):
 
         cloud_frame = normalize_frame_id(msg.header.frame_id)
         stamp = Time.from_msg(msg.header.stamp)
-        points, inference_frame = self._prepare_points_for_inference(points, cloud_frame, stamp)
-        if points.shape[0] < self.min_points:
+        prepared = self._prepare_points_for_inference(points, cloud_frame, stamp)
+        if prepared.normalized_points.shape[0] < self.min_points:
             self.get_logger().warning(
-                f"Too few valid object points for inference: {points.shape[0]} < {self.min_points}"
+                f"Too few valid object points for inference: {prepared.normalized_points.shape[0]} < {self.min_points}"
             )
             return
 
-        result = self._run_inference(points)
+        result = self._run_inference(prepared.normalized_points)
         if result.grasps.shape[0] == 0:
             self.get_logger().warning("Diffusion model returned no grasps")
             return
 
+        grasps_source = self._restore_grasps_to_source_frame(result.grasps, prepared)
         best_index = int(np.argmax(result.scores))
-        best_grasp = result.grasps[best_index]
+        best_grasp = grasps_source[best_index]
         best_score = float(result.scores[best_index])
         gripper_pose = best_grasp @ self.gripper_offset
+        output_frame = prepared.source_frame or prepared.inference_frame
 
-        self._publish_camera_pose(best_grasp, inference_frame, msg.header.stamp)
-        self._publish_base_pose(self.pub_grasp_pose_base, best_grasp, inference_frame, msg.header.stamp)
-        self._publish_base_pose(self.pub_grasp_pose_gripper, gripper_pose, inference_frame, msg.header.stamp)
-        self._publish_candidates(result, inference_frame, msg.header.stamp)
+        self._publish_pose(self.pub_grasp_pose, best_grasp, output_frame, msg.header.stamp)
+        self._publish_base_pose(self.pub_grasp_pose_base, best_grasp, output_frame, msg.header.stamp)
+        self._publish_base_pose(self.pub_grasp_pose_gripper, gripper_pose, output_frame, msg.header.stamp)
+        self._publish_candidates(grasps_source, result.scores, output_frame, msg.header.stamp)
 
         score_msg = Float32()
         score_msg.data = best_score
@@ -273,18 +290,28 @@ class DiffusionGraspNode(Node):
             f"Published best grasp score={best_score:.4f} total_candidates={result.grasps.shape[0]}"
         )
 
-    def _prepare_points_for_inference(self, points: np.ndarray, source_frame: str, stamp: Time) -> tuple[np.ndarray, str]:
+    def _prepare_points_for_inference(self, points: np.ndarray, source_frame: str, stamp: Time) -> PreparedPointCloud:
         valid = np.isfinite(points).all(axis=1) & (np.linalg.norm(points, axis=1) > 1e-6)
         points = points[valid]
-        if points.shape[0] == 0:
-            return points.astype(np.float32), self._resolve_inference_frame(source_frame)
+        inference_frame = self._resolve_inference_frame(source_frame)
+        source_from_inference = None
 
-        frame_id = self._resolve_inference_frame(source_frame)
+        if points.shape[0] == 0:
+            return PreparedPointCloud(
+                normalized_points=points.astype(np.float32),
+                source_frame=source_frame or inference_frame,
+                inference_frame=inference_frame,
+                center=np.zeros((3,), dtype=np.float32),
+                source_from_inference=source_from_inference,
+            )
+
+        frame_id = inference_frame
         if frame_id and source_frame and source_frame != frame_id:
             try:
                 transform = self._lookup_transform(frame_id, source_frame, stamp)
                 transform_matrix = transform_to_matrix(transform)
                 points = apply_transform(points, transform_matrix)
+                source_from_inference = np.linalg.inv(transform_matrix).astype(np.float32)
             except Exception as exc:
                 self.get_logger().warning(
                     f"Could not transform point cloud {source_frame} -> {frame_id}: {exc}. "
@@ -294,14 +321,54 @@ class DiffusionGraspNode(Node):
         else:
             frame_id = source_frame or frame_id
 
-        if self.max_points > 0 and points.shape[0] > self.max_points:
-            choice = np.linspace(0, points.shape[0] - 1, self.max_points, dtype=np.int64)
-            points = points[choice]
+        center = points.mean(axis=0).astype(np.float32)
+        normalized_points = (points - center[None, :]).astype(np.float32, copy=False)
+        if self.point_cloud_noise_std > 0.0:
+            noise = self._rng.normal(0.0, self.point_cloud_noise_std, size=normalized_points.shape).astype(np.float32)
+            normalized_points = normalized_points + np.clip(
+                noise,
+                -self.point_cloud_noise_clip,
+                self.point_cloud_noise_clip,
+            ).astype(np.float32, copy=False)
 
-        return points.astype(np.float32, copy=False), frame_id
+        if self.max_points > 0 and normalized_points.shape[0] > self.max_points:
+            choice = np.linspace(0, points.shape[0] - 1, self.max_points, dtype=np.int64)
+            normalized_points = normalized_points[choice]
+
+        return PreparedPointCloud(
+            normalized_points=normalized_points.astype(np.float32, copy=False),
+            source_frame=source_frame or frame_id,
+            inference_frame=frame_id,
+            center=center,
+            source_from_inference=source_from_inference,
+        )
 
     def _resolve_inference_frame(self, source_frame: str) -> str:
         return self.inference_frame or source_frame or self.robot_base_frame
+
+    def _restore_grasps_to_source_frame(
+        self,
+        grasps: np.ndarray,
+        prepared: PreparedPointCloud,
+    ) -> np.ndarray:
+        grasps = np.asarray(grasps, dtype=np.float32)
+        if grasps.ndim != 3 or grasps.shape[-2:] != (4, 4):
+            raise ValueError(f"expected grasp tensor of shape (N, 4, 4), got {grasps.shape}")
+        if grasps.shape[0] == 0:
+            return grasps.astype(np.float32, copy=False)
+
+        restored = grasps.copy()
+        restored[:, :3, 3] += prepared.center[None, :]
+        if prepared.source_from_inference is not None:
+            restored = self._left_multiply_poses(prepared.source_from_inference, restored)
+        restored[:, 3, 3] = 1.0
+        return restored.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _left_multiply_poses(transform: np.ndarray, poses: np.ndarray) -> np.ndarray:
+        transform = np.asarray(transform, dtype=np.float32)
+        poses = np.asarray(poses, dtype=np.float32)
+        return np.einsum("ij,njk->nik", transform, poses, dtype=np.float32).astype(np.float32, copy=False)
 
     def _run_inference(self, points: np.ndarray) -> InferenceResult:
         if self._backend_kind == "python":
@@ -386,24 +453,6 @@ class DiffusionGraspNode(Node):
         msg.pose = matrix_to_pose(pose_matrix)
         publisher.publish(msg)
 
-    def _publish_camera_pose(self, pose_base: np.ndarray, pose_frame: str, stamp) -> None:
-        if not self.camera_frame or self.camera_frame == pose_frame:
-            self._publish_pose(self.pub_grasp_pose_camera, pose_base, pose_frame, stamp)
-            return
-
-        try:
-            pose_camera = self._transform_pose_matrix(
-                pose_base,
-                source_frame=pose_frame,
-                target_frame=self.camera_frame,
-                stamp=Time.from_msg(stamp),
-            )
-            self._publish_pose(self.pub_grasp_pose_camera, pose_camera, self.camera_frame, stamp)
-        except Exception as exc:
-            self.get_logger().warning(
-                f"Could not publish camera-frame grasp pose ({pose_frame} -> {self.camera_frame}): {exc}"
-            )
-
     def _publish_base_pose(self, publisher, pose_matrix: np.ndarray, pose_frame: str, stamp) -> None:
         target_frame = self.robot_base_frame or pose_frame
         if not target_frame:
@@ -439,15 +488,17 @@ class DiffusionGraspNode(Node):
         transform_matrix = transform_to_matrix(transform)
         return (transform_matrix @ pose_matrix).astype(np.float32, copy=False)
 
-    def _publish_candidates(self, result: InferenceResult, frame_id: str, stamp) -> None:
-        if result.grasps.shape[0] == 0:
+    def _publish_candidates(self, grasps: np.ndarray, scores: np.ndarray, frame_id: str, stamp) -> None:
+        grasps = np.asarray(grasps, dtype=np.float32)
+        scores = np.asarray(scores, dtype=np.float32)
+        if grasps.shape[0] == 0:
             return
 
-        order = np.argsort(result.scores)[::-1][: self.candidate_count_to_publish]
+        order = np.argsort(scores)[::-1][: self.candidate_count_to_publish]
         pose_array = PoseArray()
         pose_array.header.frame_id = frame_id
         pose_array.header.stamp = stamp
-        pose_array.poses = [matrix_to_pose(result.grasps[int(idx)]) for idx in order]
+        pose_array.poses = [matrix_to_pose(grasps[int(idx)]) for idx in order]
         self.pub_grasp_candidates.publish(pose_array)
 
 
