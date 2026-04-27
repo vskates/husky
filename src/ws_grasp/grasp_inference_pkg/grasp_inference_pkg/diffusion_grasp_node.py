@@ -398,6 +398,11 @@ class DiffusionGraspNode(Node):
 
     def _subprocess_env(self) -> dict[str, str]:
         env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            env["PYTHONPATH"] = f"{self.graspgen_repo_path}:{existing_pythonpath}"
+        else:
+            env["PYTHONPATH"] = self.graspgen_repo_path
         if self.force_cpu:
             env["CUDA_VISIBLE_DEVICES"] = ""
         return env
