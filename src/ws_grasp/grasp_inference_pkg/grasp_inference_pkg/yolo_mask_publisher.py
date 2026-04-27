@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 from pathlib import Path
 
-import numpy as np
+import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -10,11 +12,6 @@ from rclpy.qos import qos_profile_sensor_data
 
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-
-
-def _is_bg_class(class_name: str) -> bool:
-    name = (class_name or "").strip().lower()
-    return name.startswith("bg")
 
 
 class YoloMaskPublisher(Node):
@@ -29,6 +26,9 @@ class YoloMaskPublisher(Node):
         self.declare_parameter("seg_conf", 0.25)
         self.declare_parameter("seg_iou", 0.7)
         self.declare_parameter("seg_force_cpu", False)
+        self.declare_parameter("conda_env_name", "isaaclab")
+        self.declare_parameter("conda_executable", "conda")
+        self.declare_parameter("subprocess_timeout_sec", 120.0)
 
         self.color_topic = str(self.get_parameter("color_topic").value)
         self.mask_topic = str(self.get_parameter("mask_topic").value)
@@ -36,24 +36,50 @@ class YoloMaskPublisher(Node):
         self.seg_imgsz = int(self.get_parameter("seg_imgsz").value)
         self.seg_conf = float(self.get_parameter("seg_conf").value)
         self.seg_iou = float(self.get_parameter("seg_iou").value)
-        self.seg_device = "cpu" if bool(self.get_parameter("seg_force_cpu").value) else None
+        self.seg_force_cpu = bool(self.get_parameter("seg_force_cpu").value)
+        self.conda_env_name = str(self.get_parameter("conda_env_name").value)
+        self.conda_executable = str(self.get_parameter("conda_executable").value)
+        self.subprocess_timeout_sec = float(self.get_parameter("subprocess_timeout_sec").value)
 
         if not self.seg_model_path.is_file():
             raise FileNotFoundError(f"YOLO weights not found: {self.seg_model_path}")
 
-        from ultralytics import YOLO
-
-        self.model = YOLO(str(self.seg_model_path))
-        names = getattr(self.model, "names", {})
-        self.class_names = dict(names) if hasattr(names, "items") else dict(enumerate(names))
+        self.helper_script = Path(__file__).with_name("yolo_mask_inference.py")
+        if not self.helper_script.is_file():
+            raise FileNotFoundError(f"YOLO helper script not found: {self.helper_script}")
 
         self.pub_mask = self.create_publisher(Image, self.mask_topic, 10)
         self.create_subscription(Image, self.color_topic, self._on_color, qos_profile_sensor_data)
 
         self.get_logger().info(
             f"YOLO mask publisher ready: color={self.color_topic} mask={self.mask_topic} "
-            f"weights={self.seg_model_path}"
+            f"weights={self.seg_model_path} conda_env={self.conda_env_name}"
         )
+
+    def _build_subprocess_command(self, input_path: Path, output_path: Path) -> list[str]:
+        cmd = [
+            self.conda_executable,
+            "run",
+            "-n",
+            self.conda_env_name,
+            "python",
+            str(self.helper_script),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--weights",
+            str(self.seg_model_path),
+            "--imgsz",
+            str(self.seg_imgsz),
+            "--conf",
+            str(self.seg_conf),
+            "--iou",
+            str(self.seg_iou),
+        ]
+        if self.seg_force_cpu:
+            cmd.extend(["--device", "cpu"])
+        return cmd
 
     def _on_color(self, msg: Image) -> None:
         try:
@@ -65,33 +91,36 @@ class YoloMaskPublisher(Node):
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             return
 
-        prediction = self.model.predict(
-            source=rgb[:, :, ::-1],
-            imgsz=self.seg_imgsz,
-            conf=self.seg_conf,
-            iou=self.seg_iou,
-            device=self.seg_device,
-            verbose=False,
-        )[0]
+        with tempfile.TemporaryDirectory(prefix="yolo_mask_") as tmp_dir:
+            input_path = Path(tmp_dir) / "input.png"
+            output_path = Path(tmp_dir) / "mask.png"
+            if not cv2.imwrite(str(input_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)):
+                self.get_logger().warning(f"Failed to write temporary image: {input_path}")
+                return
 
-        height, width = rgb.shape[:2]
-        mask = np.zeros((height, width), dtype=np.uint8)
-        if prediction.masks is not None and prediction.masks.data is not None and len(prediction.masks.data) > 0:
-            masks = prediction.masks.data
-            valid_ix = list(range(len(masks)))
-            if prediction.boxes is not None and len(prediction.boxes.cls) == len(masks) and self.class_names:
-                class_ids = prediction.boxes.cls.cpu().numpy().astype(int)
-                valid_ix = [
-                    idx for idx in valid_ix
-                    if not _is_bg_class(self.class_names.get(class_ids[idx], str(class_ids[idx])))
-                ]
-            if valid_ix:
-                masks = masks[valid_ix]
-                mask = (masks > 0.5).any(dim=0).to("cpu").numpy().astype(np.uint8) * 255
-                if mask.shape != (height, width):
-                    import cv2
+            try:
+                completed = subprocess.run(
+                    self._build_subprocess_command(input_path, output_path),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.subprocess_timeout_sec,
+                )
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.strip() if exc.stderr else str(exc)
+                self.get_logger().error(f"YOLO subprocess failed: {stderr}")
+                return
+            except subprocess.TimeoutExpired:
+                self.get_logger().error("YOLO subprocess timed out")
+                return
 
-                    mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            if completed.stderr:
+                self.get_logger().debug(completed.stderr.strip())
+
+            mask = cv2.imread(str(output_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                self.get_logger().error(f"Failed to read generated mask: {output_path}")
+                return
 
         out = self.bridge.cv2_to_imgmsg(mask, encoding="mono8")
         out.header = msg.header
