@@ -76,10 +76,17 @@ def generate_launch_description():
                 parameters=[
                     {
                         "pointcloud_topic": "/segmented_object_pcd_node/points",
+                        "full_pointcloud_topic": "/segmented_object_pcd_node/points_full",
+                        "joint_state_topic": "",
                         "inference_frame": "",
                         "robot_base_frame": "",
                         "camera_frame": "",
                         "backend_mode": "subprocess",
+                        "candidate_filter_mode": "subprocess",
+                        "candidate_filter_planning_frame": "",
+                        "curobo_robot_config_path": "/home/weshi/rl_grasp_pose/MetaIsaacGrasp/curobo_configs/astribot/astribot.yml",
+                        "curobo_robot_info_path": "/home/weshi/rl_grasp_pose/MetaIsaacGrasp/curobo_configs/astribot/robot_info.json",
+                        "gripper_mesh_path": "/home/weshi/rl_grasp_pose/MetaIsaacGrasp/models/Gripper/Astribot/astribot_sphere.obj",
                         "graspgen_repo_path": "/home/weshi/graspgen",
                         "gripper_config": "/home/weshi/graspgen/GraspGenModels/checkpoints/graspgen_astribot.yml",
                         "conda_env_name": "isaaclab",
@@ -91,6 +98,8 @@ def generate_launch_description():
                         "grasp_threshold": 0.0,
                         "remove_outliers": True,
                         "max_points": 2048,
+                        "candidate_count_to_publish": 1,
+                        "min_inference_interval_sec": 8.0,
                     }
                 ],
             ),
