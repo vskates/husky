@@ -49,6 +49,7 @@ def generate_launch_description():
                         "seg_iou": 0.7,
                         "seg_force_cpu": False,
                         "conda_env_name": "isaaclab",
+                        "conda_executable": "/home/weshi/miniconda3/bin/conda",
                     }
                 ],
             ),
@@ -82,6 +83,7 @@ def generate_launch_description():
                         "graspgen_repo_path": "/home/weshi/graspgen",
                         "gripper_config": "/home/weshi/graspgen/GraspGenModels/checkpoints/graspgen_astribot.yml",
                         "conda_env_name": "isaaclab",
+                        "conda_executable": "/home/weshi/miniconda3/bin/conda",
                         "num_grasps": 500,
                         "topk_num_grasps": 200,
                         "min_grasps": 40,
