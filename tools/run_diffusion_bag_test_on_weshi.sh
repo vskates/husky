@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 REPO_DIR="${HOME}/HuskyRLGrasp"
 BAG_PATH="${1:-${REPO_DIR}/data}"
